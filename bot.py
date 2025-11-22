@@ -3,7 +3,9 @@ import json
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import List, Dict, Any, Optional
 
+import requests
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -12,8 +14,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
-from openai import OpenAI
 
 # ============= CONFIG =============
 
@@ -26,8 +26,8 @@ TIMEZONE = ZoneInfo("America/New_York")
 # max messages we realistically store in memory per chat (safety cap)
 MAX_ORDERS_MEMORY = 1000
 
-# OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = "gpt-4o-mini"
 
 # logging
 logging.basicConfig(
@@ -36,19 +36,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ============= STATE =============
 
 # In-memory state (no external DB)
-# Structure:
 # CHAT_STATE[chat_id] = {
 #   "orders": [ { "timestamp": datetime, "location": str, "amount": float } ],
 #   "manual_active": bool,
 #   "manual_start": datetime | None,
 # }
-CHAT_STATE = {}
+CHAT_STATE: Dict[int, Dict[str, Any]] = {}
 
 
-def get_chat_state(chat_id: int) -> dict:
+def get_chat_state(chat_id: int) -> Dict[str, Any]:
     """Return (and initialize) state for this chat."""
     if chat_id not in CHAT_STATE:
         CHAT_STATE[chat_id] = {
@@ -59,9 +59,49 @@ def get_chat_state(chat_id: int) -> dict:
     return CHAT_STATE[chat_id]
 
 
-# ============= OPENAI PARSER =============
+# ============= OPENAI VIA HTTP =============
 
-async def extract_orders_from_text(text: str) -> list[dict]:
+def call_openai_chat(prompt: str) -> Optional[str]:
+    """
+    Call OpenAI's chat completions endpoint using plain HTTP.
+    Returns the message content string, or None on error.
+    """
+    if not OPENAI_API_KEY:
+        logger.error("OPENAI_API_KEY is not set.")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You extract structured delivery orders (location + amount) and respond ONLY with JSON.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    }
+
+    try:
+        resp = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        return content
+    except Exception as e:
+        logger.error(f"Error calling OpenAI HTTP API: {e}")
+        return None
+
+
+async def extract_orders_from_text(text: str) -> List[Dict[str, Any]]:
     """
     Use OpenAI to extract zero or more orders from a single message.
 
@@ -102,45 +142,34 @@ Now extract orders from this message:
 \"\"\"{text}\"\"\"
 """
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You extract structured delivery orders (location + amount) and respond ONLY with JSON.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-        )
-
-        content = response.choices[0].message.content.strip()
-
-        # Sometimes models wrap JSON in code fences – strip if needed
-        if content.startswith("```"):
-            content = content.strip("`")
-            # after stripping backticks, remove possible language hint like json\n
-            if "\n" in content:
-                content = content.split("\n", 1)[1].strip()
-
-        data = json.loads(content)
-
-        orders = []
-        if isinstance(data, list):
-            for item in data:
-                try:
-                    loc = str(item.get("location", "")).strip()
-                    amt = float(item.get("amount", 0))
-                    if loc and amt > 0:
-                        orders.append({"location": loc, "amount": amt})
-                except Exception:
-                    continue
-        return orders
-
-    except Exception as e:
-        logger.error(f"Error calling OpenAI: {e}")
+    content = call_openai_chat(prompt)
+    if content is None:
         return []
+
+    # Sometimes models wrap JSON in code fences – strip if needed
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.strip("`")
+        if "\n" in content:
+            content = content.split("\n", 1)[1].strip()
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error from OpenAI response: {e} | content={content[:200]}")
+        return []
+
+    orders: List[Dict[str, Any]] = []
+    if isinstance(data, list):
+        for item in data:
+            try:
+                loc = str(item.get("location", "")).strip()
+                amt = float(item.get("amount", 0))
+                if loc and amt > 0:
+                    orders.append({"location": loc, "amount": amt})
+            except Exception:
+                continue
+    return orders
 
 
 # ============= HELPERS =============
@@ -150,30 +179,29 @@ def last_monday_start(now_utc: datetime) -> datetime:
     Get the datetime for Monday 00:00 of the current week in local TIMEZONE,
     then convert back to UTC.
     """
-    # convert to local tz
     local_now = now_utc.astimezone(TIMEZONE)
-    # Monday is 0
-    days_since_monday = local_now.weekday()  # 0-6
+    days_since_monday = local_now.weekday()  # Monday=0
     monday_local = (local_now - timedelta(days=days_since_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    # back to UTC
     return monday_local.astimezone(ZoneInfo("UTC"))
 
 
-def prune_old_orders(chat_state: dict):
+def prune_old_orders(chat_state: Dict[str, Any]):
     """
     Keep the orders list from growing forever.
     Strategy: if > MAX_ORDERS_MEMORY, drop the oldest ones.
     """
     orders = chat_state["orders"]
     if len(orders) > MAX_ORDERS_MEMORY:
-        # keep the newest ones
-        to_keep = orders[-MAX_ORDERS_MEMORY:]
-        chat_state["orders"] = to_keep
+        chat_state["orders"] = orders[-MAX_ORDERS_MEMORY:]
 
 
-def compute_totals(chat_state: dict, start: datetime, end: datetime | None = None):
+def compute_totals(
+    chat_state: Dict[str, Any],
+    start: datetime,
+    end: Optional[datetime] = None,
+):
     """
     Sum amounts per location between [start, end].
     end can be None = now.
@@ -181,7 +209,7 @@ def compute_totals(chat_state: dict, start: datetime, end: datetime | None = Non
     if end is None:
         end = datetime.now(tz=ZoneInfo("UTC"))
 
-    per_location = {}
+    per_location: Dict[str, float] = {}
     grand_total = 0.0
 
     for order in chat_state["orders"]:
@@ -196,11 +224,11 @@ def compute_totals(chat_state: dict, start: datetime, end: datetime | None = Non
     return per_location, grand_total
 
 
-def format_totals_message(per_location: dict, grand_total: float, label: str) -> str:
+def format_totals_message(per_location: Dict[str, float], grand_total: float, label: str) -> str:
     if not per_location:
         return f"{label} – No orders found in this period."
 
-    lines = [f"{label}"]
+    lines = [label]
     for loc, amt in sorted(per_location.items()):
         lines.append(f"{loc}: ${amt:.2f}")
     lines.append("")
@@ -226,7 +254,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help – show this message again\n\n"
         "Note: totals are in-memory only. If the bot is restarted or redeployed, counters reset."
     )
-    await update.message.reply_text(msg)
+    if update.message:
+        await update.message.reply_text(msg)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,17 +275,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = message.text
     chat_state = get_chat_state(chat_id)
 
-    # Telegram gives UTC-aware datetime
     msg_time = message.date
     if msg_time.tzinfo is None:
         msg_time = msg_time.replace(tzinfo=ZoneInfo("UTC"))
 
-    # extract with OpenAI
     orders = await extract_orders_from_text(text)
     if not orders:
         return
 
-    # store orders in memory
     for o in orders:
         chat_state["orders"].append(
             {
@@ -267,7 +293,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     prune_old_orders(chat_state)
-
     logger.info(
         f"Chat {chat_id}: stored {len(orders)} orders from message {message.message_id}"
     )
@@ -280,6 +305,9 @@ async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - Else: from last Monday 00:00 (business timezone) .. now
     """
     message = update.message
+    if not message:
+        return
+
     chat_id = message.chat_id
     chat_state = get_chat_state(chat_id)
 
@@ -298,7 +326,6 @@ async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # alias of /totals
     await totals_command(update, context)
 
 
@@ -308,6 +335,9 @@ async def startweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from 'now' (UTC).
     """
     message = update.message
+    if not message:
+        return
+
     chat_id = message.chat_id
     chat_state = get_chat_state(chat_id)
 
@@ -328,6 +358,9 @@ async def endweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     and return to automatic calendar-week mode.
     """
     message = update.message
+    if not message:
+        return
+
     chat_id = message.chat_id
     chat_state = get_chat_state(chat_id)
 
@@ -343,7 +376,6 @@ async def endweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     per_location, grand_total = compute_totals(chat_state, start=start, end=now_utc)
     text = format_totals_message(per_location, grand_total, "MANUAL WEEK FINAL TOTALS")
 
-    # reset manual mode
     chat_state["manual_active"] = False
     chat_state["manual_start"] = None
 
@@ -364,7 +396,6 @@ def main():
         .build()
     )
 
-    # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("totals", totals_command))
@@ -372,7 +403,6 @@ def main():
     application.add_handler(CommandHandler("startweek", startweek_command))
     application.add_handler(CommandHandler("endweek", endweek_command))
 
-    # Any other text -> attempt extraction
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
