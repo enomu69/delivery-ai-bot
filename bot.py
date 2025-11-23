@@ -1,9 +1,10 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import urlencode
 
 import requests
 from telegram import Update
@@ -20,25 +21,14 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
-SUPABASE_ORDERS_URL = (
-    f"{SUPABASE_URL.rstrip('/')}/rest/v1/orders" if SUPABASE_URL else None
-)
-
-# Column name in Supabase for the order timestamp
-SUPABASE_ORDER_TS_COLUMN = "order_timestamp"
-
+# timezone for reporting (your business timezone)
 TIMEZONE = ZoneInfo("America/New_York")
-UTC = ZoneInfo("UTC")
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4o-mini"
-
-WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-
-MAX_ROWS_PER_QUERY = 10000
 
 # logging
 logging.basicConfig(
@@ -47,35 +37,177 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ============= STATE =============
-
-# In-memory state only for manual week flags per chat.
-# Orders themselves live in Supabase so they survive restarts.
-#
-# CHAT_STATE[chat_id] = {
-#   "manual_active": bool,
-#   "manual_start": datetime | None,
-# }
-CHAT_STATE: Dict[int, Dict[str, Any]] = {}
+# Per-chat config (in memory only; resets on restart)
+CHAT_CONFIG: Dict[int, Dict[str, Any]] = {}
+DEFAULT_SUMMARY_MODE = "full"  # full | medium | compact
 
 
-def get_chat_state(chat_id: int) -> Dict[str, Any]:
-    if chat_id not in CHAT_STATE:
-        CHAT_STATE[chat_id] = {
-            "manual_active": False,
-            "manual_start": None,
+def get_chat_config(chat_id: int) -> Dict[str, Any]:
+    if chat_id not in CHAT_CONFIG:
+        CHAT_CONFIG[chat_id] = {
+            "summary_mode": DEFAULT_SUMMARY_MODE,
         }
-    return CHAT_STATE[chat_id]
+    return CHAT_CONFIG[chat_id]
 
 
-# ============= OPENAI VIA HTTP =============
+# ============= SUPABASE HELPERS =============
+
+def supabase_headers() -> Dict[str, str]:
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def supabase_insert_orders(
+    chat_id: int,
+    orders: List[Dict[str, Any]],
+    msg_time_utc: datetime,
+):
+    """
+    Insert new orders as status 'pending'.
+    Each order: {"location": str, "amount": float}
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.error("Supabase config missing; cannot insert orders.")
+        return
+
+    url = f"{SUPABASE_URL}/rest/v1/orders"
+
+    rows = []
+    # start of calendar week (Monday 00:00) in UTC
+    week_start_local = msg_time_utc.astimezone(TIMEZONE)
+    days_since_monday = week_start_local.weekday()
+    monday_local = (week_start_local - timedelta(days=days_since_monday)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    week_start_utc = monday_local.astimezone(ZoneInfo("UTC"))
+
+    for o in orders:
+        rows.append(
+            {
+                "chat_id": str(chat_id),
+                "location": o["location"],
+                "amount": float(o["amount"]),
+                "order_timestamp": msg_time_utc.isoformat(),
+                "week_start": week_start_utc.isoformat(),
+                "status": "pending",
+            }
+        )
+
+    try:
+        params = {"select": "id,location,amount,status"}
+        headers = supabase_headers()
+        headers["Prefer"] = "return=representation"
+        resp = requests.post(
+            url,
+            params=params,
+            headers=headers,
+            data=json.dumps(rows),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info(f"Inserted {len(data)} orders to Supabase for chat {chat_id}")
+    except Exception as e:
+        logger.error(f"Supabase insert error: {e}")
+
+
+def supabase_fetch_orders(
+    chat_id: int,
+    status: Optional[str] = None,
+    start_utc: Optional[datetime] = None,
+    end_utc: Optional[datetime] = None,
+    limit: Optional[int] = None,
+    order_desc: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch orders for a chat with optional filters.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.error("Supabase config missing; cannot fetch orders.")
+        return []
+
+    url = f"{SUPABASE_URL}/rest/v1/orders"
+
+    params_list = [
+        ("select", "id,chat_id,location,amount,order_timestamp,status"),
+        ("chat_id", f"eq.{chat_id}"),
+    ]
+
+    if status:
+        params_list.append(("status", f"eq.{status}"))
+    if start_utc:
+        params_list.append(("order_timestamp", f"gte.{start_utc.isoformat()}"))
+    if end_utc:
+        params_list.append(("order_timestamp", f"lt.{end_utc.isoformat()}"))
+    if limit:
+        params_list.append(("limit", str(limit)))
+    order_dir = "desc" if order_desc else "asc"
+    params_list.append(("order", f"order_timestamp.{order_dir}"))
+
+    params = urlencode(params_list, doseq=True)
+
+    try:
+        resp = requests.get(
+            url,
+            headers=supabase_headers(),
+            params=params,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data
+    except Exception as e:
+        logger.error(f"Supabase fetch error: {e}")
+        return []
+
+
+def supabase_fetch_pending(chat_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+    return supabase_fetch_orders(
+        chat_id=chat_id,
+        status="pending",
+        start_utc=None,
+        end_utc=None,
+        limit=limit,
+        order_desc=True,
+    )
+
+
+def supabase_update_status(order_ids: List[int], new_status: str):
+    if not order_ids:
+        return
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.error("Supabase config missing; cannot update status.")
+        return
+
+    url = f"{SUPABASE_URL}/rest/v1/orders"
+    headers = supabase_headers()
+    headers["Prefer"] = "return=representation"
+
+    for oid in order_ids:
+        params = {
+            "id": f"eq.{oid}",
+            "select": "id,location,amount,status",
+        }
+        try:
+            resp = requests.patch(
+                url,
+                params=params,
+                headers=headers,
+                data=json.dumps({"status": new_status}),
+                timeout=15,
+            )
+            resp.raise_for_status()
+            logger.info(f"Updated order {oid} to status={new_status}")
+        except Exception as e:
+            logger.error(f"Supabase status update error for id={oid}: {e}")
+
+
+# ============= OPENAI ORDER EXTRACTION =============
 
 def call_openai_chat(prompt: str) -> Optional[str]:
-    """
-    Call OpenAI's chat completions endpoint using plain HTTP.
-    Returns the message content string, or None on error.
-    """
     if not OPENAI_API_KEY:
         logger.error("OPENAI_API_KEY is not set.")
         return None
@@ -91,12 +223,12 @@ def call_openai_chat(prompt: str) -> Optional[str]:
         "messages": [
             {
                 "role": "system",
-                "content": "You extract structured delivery orders (location + amount) and respond ONLY with JSON.",
+                "content": (
+                    "You extract structured delivery orders (location + amount) "
+                    "and respond ONLY with JSON."
+                ),
             },
-            {
-                "role": "user",
-                "content": prompt,
-            },
+            {"role": "user", "content": prompt},
         ],
     }
 
@@ -113,13 +245,7 @@ def call_openai_chat(prompt: str) -> Optional[str]:
 
 async def extract_orders_from_text(text: str) -> List[Dict[str, Any]]:
     """
-    Use OpenAI to extract zero or more orders from a single message.
-
-    Returns a list of objects like:
-    [
-      {"location": "Manassas", "amount": 35.0},
-      {"location": "Alexandria", "amount": 30.0}
-    ]
+    Use OpenAI to extract zero or more orders from a dispatcher message.
     """
     # quick cheap heuristic: if no digit, probably no amount -> skip OpenAI
     if not any(ch.isdigit() for ch in text):
@@ -137,7 +263,7 @@ Your job:
 - Read the message carefully.
 - Find ALL delivery orders mentioned.
 - For each, return an object with "location" and "amount".
-- Ignore time windows (like "11-12", "3-4"), emojis, extra commentary, and anything not clearly an order.
+- Ignore time windows, emojis, extra commentary, and anything not clearly an order.
 - If a location is mentioned with no clear dollar amount, skip that location.
 - If the message does NOT contain any valid orders, return an empty list.
 
@@ -156,7 +282,6 @@ Now extract orders from this message:
     if content is None:
         return []
 
-    # Sometimes models wrap JSON in code fences – strip if needed
     content = content.strip()
     if content.startswith("```"):
         content = content.strip("`")
@@ -182,450 +307,241 @@ Now extract orders from this message:
     return orders
 
 
-# ============= SUPABASE HELPERS =============
+# ============= INTENT + CONFIRMATION / REJECTION =============
 
-def supabase_headers() -> Dict[str, str]:
-    if not SUPABASE_SERVICE_KEY:
-        raise RuntimeError("SUPABASE_SERVICE_KEY is not set.")
-    return {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Prefer": "return=minimal",
-    }
+ACCEPT_EMOJIS = {"👍", "❤️", "♥️", "🙏", "🙌", "🔥", "✔️", "✅", "😎", "👌", "💯", "😁", "🙂", "🤝", "🚀"}
+REJECT_EMOJIS = {"👎", "❌", "🚫", "⛔", "😕", "😒", "🤦"}
 
 
-def save_order_to_supabase(
-    chat_id: int,
-    msg_time: datetime,
-    location: str,
-    amount: float,
-    week_start_utc: datetime,
-):
+ACCEPT_PHRASES = [
+    "send it",
+    "send them",
+    "send",
+    "coming",
+    "on the way",
+    "otw",
+    "omw",
+    "headed there",
+    "be there soon",
+    "i'll take",
+    "ill take",
+    "i will take",
+    "i can take",
+    "i can do",
+    "i'll do",
+    "ill do",
+    "run it",
+    "lock me in",
+    "got it",
+    "got them",
+    "i got it",
+    "i got them",
+    "i'll grab",
+    "ill grab",
+    "i'll scoop",
+    "ill scoop",
+    "i'll go",
+    "ill go",
+    "i'll pick it up",
+    "ill pick it up",
+    "i'm down",
+    "im down",
+    "sure",
+    "ok",
+    "okay",
+    "bet",
+    "say less",
+    "i'll take both",
+    "ill take both",
+    "i'll take them",
+    "ill take them",
+    "i'll take it",
+    "ill take it",
+    "i'll do it",
+    "ill do it",
+]
+
+REJECT_PHRASES = [
+    "can't",
+    "cant",
+    "cannot",
+    "won't",
+    "wont",
+    "no ",
+    " no",
+    "nah",
+    "not taking",
+    "don't want",
+    "dont want",
+    "skip it",
+    "skip that",
+    "pass",
+    "reject",
+    "drop it",
+    "can't do",
+    "cant do",
+    "can't take",
+    "cant take",
+]
+
+
+def classify_intent(text: str) -> Optional[str]:
     """
-    Insert a single order row into Supabase.
+    Return 'accept', 'reject', or None.
     """
-    if not SUPABASE_ORDERS_URL:
-        logger.error("SUPABASE_URL is not set.")
-        return
+    t = text.strip()
+    if not t:
+        return None
 
-    try:
-        payload = {
-            "chat_id": str(chat_id),
-            "location": location,
-            "amount": amount,
-            "week_start": week_start_utc.astimezone(UTC).isoformat(),
-            SUPABASE_ORDER_TS_COLUMN: msg_time.astimezone(UTC).isoformat(),
-        }
+    # emoji-only messages
+    if len(t) <= 4 and all(ch in ACCEPT_EMOJIS or ch in REJECT_EMOJIS for ch in t):
+        if any(ch in REJECT_EMOJIS for ch in t):
+            return "reject"
+        if any(ch in ACCEPT_EMOJIS for ch in t):
+            return "accept"
 
-        resp = requests.post(
-            SUPABASE_ORDERS_URL,
-            headers=supabase_headers(),
-            json=payload,
-            timeout=10,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"Error inserting order into Supabase: {e}")
+    lower = t.lower()
+
+    # check rejection first (so "can't take it" doesn't get treated as accept)
+    for phrase in REJECT_PHRASES:
+        if phrase in lower:
+            return "reject"
+
+    for phrase in ACCEPT_PHRASES:
+        if phrase in lower:
+            return "accept"
+
+    return None
 
 
-def fetch_orders_from_supabase(
-    chat_id: int,
-    start_utc: datetime,
-    end_utc: datetime,
-) -> List[Dict[str, Any]]:
+def match_orders_for_message(
+    message_text: str,
+    pending_orders: List[Dict[str, Any]],
+) -> List[int]:
     """
-    Fetch orders for a given chat between [start_utc, end_utc], sorted oldest -> newest.
+    Decide which pending orders a confirmation/rejection applies to.
+    Strategy:
+      - if only one pending -> that one
+      - else, if message mentions a location name -> those that match
+      - else, if message says "both"/"all" -> all
+      - else -> most recent only
     """
-    if not SUPABASE_ORDERS_URL:
-        logger.error("SUPABASE_URL is not set.")
+    if not pending_orders:
         return []
 
-    params = [
-        ("chat_id", f"eq.{chat_id}"),
-        (SUPABASE_ORDER_TS_COLUMN, f"gte.{start_utc.astimezone(UTC).isoformat()}"),
-        (SUPABASE_ORDER_TS_COLUMN, f"lte.{end_utc.astimezone(UTC).isoformat()}"),
-        ("order", f"{SUPABASE_ORDER_TS_COLUMN}.asc"),
-        ("limit", str(MAX_ROWS_PER_QUERY)),
-    ]
+    if len(pending_orders) == 1:
+        return [pending_orders[0]["id"]]
 
-    try:
-        resp = requests.get(
-            SUPABASE_ORDERS_URL,
-            headers=supabase_headers(),
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        orders: List[Dict[str, Any]] = []
-        for row in data:
-            try:
-                ts_str = row.get(SUPABASE_ORDER_TS_COLUMN)
-                ts = (
-                    datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    if ts_str
-                    else None
-                )
-                if ts is None:
-                    continue
-                orders.append(
-                    {
-                        "timestamp": ts,
-                        "location": row.get("location", ""),
-                        "amount": float(row.get("amount", 0) or 0),
-                    }
-                )
-            except Exception:
-                continue
-        return orders
-    except Exception as e:
-        logger.error(f"Error fetching orders from Supabase: {e}")
-        return []
+    txt = message_text.lower()
+
+    # try location-based matching
+    matched_ids: List[int] = []
+    for o in pending_orders:
+        loc = str(o.get("location", "")).lower()
+        if loc and loc in txt:
+            matched_ids.append(o["id"])
+
+    if matched_ids:
+        return matched_ids
+
+    # phrases for multiple
+    if "both" in txt or "all" in txt or "2 orders" in txt or "two orders" in txt:
+        return [o["id"] for o in pending_orders]
+
+    # default: most recent pending (first in list because we sorted desc)
+    return [pending_orders[0]["id"]]
 
 
-def fetch_all_orders(chat_id: int) -> List[Dict[str, Any]]:
-    """
-    Fetch ALL orders for this chat.
-    """
-    if not SUPABASE_ORDERS_URL:
-        logger.error("SUPABASE_URL is not set.")
-        return []
+# ============= COMMAND HELPERS =============
 
-    params = [
-        ("chat_id", f"eq.{chat_id}"),
-        ("order", f"{SUPABASE_ORDER_TS_COLUMN}.asc"),
-        ("limit", str(MAX_ROWS_PER_QUERY)),
-    ]
-
-    try:
-        resp = requests.get(
-            SUPABASE_ORDERS_URL,
-            headers=supabase_headers(),
-            params=params,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        orders: List[Dict[str, Any]] = []
-        for row in data:
-            try:
-                ts_str = row.get(SUPABASE_ORDER_TS_COLUMN)
-                ts = (
-                    datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    if ts_str
-                    else None
-                )
-                if ts is None:
-                    continue
-                orders.append(
-                    {
-                        "timestamp": ts,
-                        "location": row.get("location", ""),
-                        "amount": float(row.get("amount", 0) or 0),
-                    }
-                )
-            except Exception:
-                continue
-        return orders
-    except Exception as e:
-        logger.error(f"Error fetching all orders from Supabase: {e}")
-        return []
+def start_of_today_utc() -> datetime:
+    now_local = datetime.now(tz=TIMEZONE)
+    today_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return today_local.astimezone(ZoneInfo("UTC"))
 
 
-def clear_orders_for_chat(chat_id: int) -> None:
-    if not SUPABASE_ORDERS_URL:
-        return
-    try:
-        params = [("chat_id", f"eq.{chat_id}")]
-        resp = requests.delete(
-            SUPABASE_ORDERS_URL,
-            headers=supabase_headers(),
-            params=params,
-            timeout=20,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"Error clearing orders for chat {chat_id}: {e}")
-
-
-# ============= DATE HELPERS =============
-
-def last_monday_start(now_utc: datetime) -> datetime:
-    """
-    Get the datetime for Monday 00:00 of the current week in local TIMEZONE,
-    then convert back to UTC.
-    """
-    local_now = now_utc.astimezone(TIMEZONE)
-    days_since_monday = local_now.weekday()  # Monday=0
-    monday_local = (local_now - timedelta(days=days_since_monday)).replace(
+def start_of_week_utc() -> datetime:
+    now_local = datetime.now(tz=TIMEZONE)
+    days_since_monday = now_local.weekday()
+    monday_local = (now_local - timedelta(days=days_since_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    return monday_local.astimezone(UTC)
+    return monday_local.astimezone(ZoneInfo("UTC"))
 
 
-def get_week_period(chat_state: Dict[str, Any]) -> Tuple[datetime, datetime, str]:
-    """
-    Return (start_utc, end_utc, label) for the current period:
-    Hybrid logic:
-    - If manual week active: from manual_start .. now
-    - Else: calendar week since Monday 00:00 (business timezone) .. now
-    """
-    now_utc = datetime.now(tz=UTC)
-    if chat_state["manual_active"] and chat_state["manual_start"] is not None:
-        start = chat_state["manual_start"]
-        label = "MANUAL WEEK TOTALS"
-    else:
-        start = last_monday_start(now_utc)
-        label = "CALENDAR WEEK TOTALS (since Monday 00:00)"
-    return start, now_utc, label
+def days_ago_utc(days: int) -> datetime:
+    now_utc = datetime.now(tz=ZoneInfo("UTC"))
+    return now_utc - timedelta(days=days)
 
 
-def get_today_bounds() -> Tuple[datetime, datetime, str]:
-    now_local = datetime.now(tz=TIMEZONE)
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=1)
-    return start_local.astimezone(UTC), end_local.astimezone(UTC), now_local.strftime("%A")
+def summarize_orders(
+    orders: List[Dict[str, Any]],
+    label: str,
+    summary_mode: str = "full",
+) -> str:
+    if not orders:
+        return f"{label}\n\nNo accepted orders in this period."
 
-
-def get_yesterday_bounds() -> Tuple[datetime, datetime, str]:
-    now_local = datetime.now(tz=TIMEZONE)
-    today_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_local = today_start_local - timedelta(days=1)
-    end_local = today_start_local
-    day_name = start_local.strftime("%A")
-    return start_local.astimezone(UTC), end_local.astimezone(UTC), day_name
-
-
-def get_last_n_days_bounds(n: int) -> Tuple[datetime, datetime]:
-    """
-    Inclusive of today.
-    Example: n=7 → today + previous 6 full days.
-    """
-    now_local = datetime.now(tz=TIMEZONE)
-    today_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_local = today_start_local - timedelta(days=n - 1)
-    start_utc = start_local.astimezone(UTC)
-    end_utc = now_local.astimezone(UTC)
-    return start_utc, end_utc
-
-
-# ============= STATS & FORMATTING HELPERS =============
-
-def group_orders_by_weekday(orders: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    # convert timestamps to local & group by date
     grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for order in orders:
-        ts_local = order["timestamp"].astimezone(TIMEZONE)
-        day = ts_local.strftime("%A")
-        grouped.setdefault(day, []).append(order)
-    return grouped
+    total_amount = 0.0
 
-
-def format_orders_grouped_by_weekday_per_order(
-    orders: List[Dict[str, Any]],
-    label: str,
-) -> str:
-    """
-    Used for /totals-style weekly view: lists each order grouped by weekday.
-    """
-    if not orders:
-        return f"{label} – No orders found in this period."
-
-    grouped = group_orders_by_weekday(orders)
-    total = sum(o["amount"] for o in orders)
+    for o in orders:
+        ts = datetime.fromisoformat(o["order_timestamp"].replace("Z", "+00:00"))
+        local_date = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d (%a)")
+        grouped.setdefault(local_date, []).append(o)
+        total_amount += float(o["amount"])
 
     lines: List[str] = [label, ""]
-    for day in WEEKDAY_ORDER:
-        day_orders = grouped.get(day, [])
-        if not day_orders:
-            continue
-        lines.append(day.upper())
-        for o in day_orders:
-            lines.append(f"• {o['location']} — ${o['amount']:.2f}")
-        lines.append("")  # blank line between days
+    num_days = len(grouped)
 
-    lines.append(f"TOTAL FOR PERIOD: ${total:.2f}")
-    return "\n".join(lines).rstrip()
+    for date_key in sorted(grouped.keys()):
+        day_orders = grouped[date_key]
+        day_total = sum(float(o["amount"]) for o in day_orders)
 
+        if summary_mode in ("full", "medium"):
+            lines.append(f"{date_key}: ${day_total:.2f}")
 
-def compute_basic_stats(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
-    amounts = [o["amount"] for o in orders]
-    total = sum(amounts)
-    count = len(amounts)
-    avg = total / count if count else 0.0
-    max_amt = max(amounts) if amounts else 0.0
-    min_amt = min(amounts) if amounts else 0.0
-    return {
-        "total_orders": count,
-        "total_amount": total,
-        "avg_order": avg,
-        "max_order": max_amt,
-        "min_order": min_amt,
-    }
+        if summary_mode == "full":
+            # show individual orders in time order
+            for o in sorted(
+                day_orders,
+                key=lambda x: x["order_timestamp"],
+            ):
+                lines.append(f"  - {o['location']}: ${float(o['amount']):.2f}")
+            lines.append("")
 
+    if summary_mode == "compact":
+        lines = [label, ""]
 
-def compute_daily_totals(orders: List[Dict[str, Any]]) -> Dict[date, float]:
-    """
-    Aggregate revenue by calendar date (local TZ).
-    """
-    by_day: Dict[date, float] = {}
-    for o in orders:
-        d = o["timestamp"].astimezone(TIMEZONE).date()
-        by_day[d] = by_day.get(d, 0.0) + o["amount"]
-    return by_day
-
-
-def compute_location_stats(orders: List[Dict[str, Any]]) -> Tuple[Dict[str, int], Dict[str, float]]:
-    """
-    Returns (counts_by_location, revenue_by_location)
-    """
-    counts: Dict[str, int] = {}
-    revenue: Dict[str, float] = {}
-    for o in orders:
-        loc = o["location"] or "Unknown"
-        counts[loc] = counts.get(loc, 0) + 1
-        revenue[loc] = revenue.get(loc, 0.0) + o["amount"]
-    return counts, revenue
-
-
-def summarize_orders_range(
-    orders: List[Dict[str, Any]],
-    label: str,
-    detail_level: str = "medium",
-) -> str:
-    """
-    Generic summary for any date range.
-    detail_level: "compact" | "medium" | "full"
-    """
-    if not orders:
-        return f"{label}\n\nNo orders found in this period."
-
-    stats = compute_basic_stats(orders)
-    daily_totals = compute_daily_totals(orders)
-    counts_by_loc, revenue_by_loc = compute_location_stats(orders)
-
-    days_count = len(daily_totals)
-    avg_per_day = stats["total_amount"] / days_count if days_count else 0.0
-
-    # Busiest / slowest day by revenue
-    busiest_day = None
-    slowest_day = None
-    if daily_totals:
-        busiest_day = max(daily_totals.items(), key=lambda x: x[1])
-        slowest_day = min(daily_totals.items(), key=lambda x: x[1])
-
-    def fmt_day(d: date, amount: float) -> str:
-        weekday = d.strftime("%A")
-        return f"{weekday} {d.isoformat()} – ${amount:.2f}"
-
-    # Top locations by count
-    sorted_locs = sorted(counts_by_loc.items(), key=lambda x: x[1], reverse=True)
-    total_orders = stats["total_orders"]
-
-    lines: List[str] = [label, ""]
-
-    # Shared core info
-    lines.append(f"Total Orders: {stats['total_orders']}")
-    lines.append(f"Total Revenue: ${stats['total_amount']:.2f}")
-    lines.append(f"Average Order: ${stats['avg_order']:.2f}")
-    lines.append(f"Average Revenue Per Day: ${avg_per_day:.2f}")
-    lines.append(f"Largest Order: ${stats['max_order']:.2f}")
-    lines.append(f"Smallest Order: ${stats['min_order']:.2f}")
-
-    if busiest_day:
-        lines.append(
-            f"Busiest Day: {fmt_day(busiest_day[0], busiest_day[1])}"
-        )
-    if slowest_day and slowest_day != busiest_day:
-        lines.append(
-            f"Slowest Day: {fmt_day(slowest_day[0], slowest_day[1])}"
-        )
-
-    # Compact: stop here
-    if detail_level == "compact":
-        return "\n".join(lines)
-
-    # Medium & Full: add top locations
-    lines.append("")
-    lines.append("Top Locations:")
-    top_n = 3 if detail_level == "medium" else len(sorted_locs)
-    for loc, cnt in sorted_locs[:top_n]:
-        pct = (cnt / total_orders) * 100 if total_orders else 0.0
-        lines.append(f"• {loc} – {cnt} orders ({pct:.1f}%)")
-
-    # Medium: add short revenue-by-day (sorted high → low)
-    if detail_level == "medium":
-        lines.append("")
-        lines.append("Revenue by Day (top 7):")
-        for d, amt in sorted(daily_totals.items(), key=lambda x: x[1], reverse=True)[:7]:
-            lines.append(f"• {fmt_day(d, amt)}")
-        return "\n".join(lines)
-
-    # Full: full revenue-by-day + weekday totals
-    lines.append("")
-    lines.append("Revenue by Day (all):")
-    for d in sorted(daily_totals.keys()):
-        amt = daily_totals[d]
-        lines.append(f"• {fmt_day(d, amt)}")
-
-    # Weekday totals
-    weekday_totals: Dict[str, float] = {}
-    for o in orders:
-        wd = o["timestamp"].astimezone(TIMEZONE).strftime("%A")
-        weekday_totals[wd] = weekday_totals.get(wd, 0.0) + o["amount"]
-
-    lines.append("")
-    lines.append("Totals by Weekday:")
-    for wd in WEEKDAY_ORDER:
-        if wd in weekday_totals:
-            lines.append(f"{wd}: ${weekday_totals[wd]:.2f}")
+    lines.append(f"TOTAL: ${total_amount:.2f}")
+    avg_per_day = total_amount / num_days if num_days > 0 else 0.0
+    lines.append(f"Avg per active day: ${avg_per_day:.2f}")
 
     return "\n".join(lines)
 
 
-def parse_detail_level(args: List[str]) -> str:
-    """
-    Look for 'compact' or 'full' in args; default 'medium'.
-    """
-    lowered = [a.lower() for a in args]
-    if "compact" in lowered:
-        return "compact"
-    if "full" in lowered:
-        return "full"
-    return "medium"
-
-
-# ============= COMMAND HANDLERS =============
+# ============= HANDLERS =============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Hey! I'm your delivery totals bot.\n\n"
-        "I watch this chat for dispatch messages like:\n"
-        "• I have Manassas for $35 for 3-4 Alex\n"
-        "• I have largo $27 1-2 can go early and Alexandria $30 2-3\n"
-        "• Adding Woodbridge to route for $35\n\n"
-        "Then I extract the location + amount and keep a running tally.\n\n"
-        "Core commands:\n"
-        "/totals – detailed list for current week/manual period grouped by weekday\n"
-        "/week – same as /totals\n"
-        "/today – today’s orders\n"
-        "/yesterday – yesterday’s orders\n"
-        "/revenue – daily totals for current period\n"
-        "/stats – summary stats for current period\n"
-        "/orders – alias for /totals\n"
-        "/startweek – start a manual payout week (overrides auto calendar week)\n"
-        "/endweek – end the current manual week and show totals\n"
-        "/clear – clear all stored data for this chat\n\n"
-        "Advanced stats (include optional 'compact' or 'full'):\n"
-        "/last7days, /last14days, /last30days, /last60days, /last90days,\n"
-        "/last180days, /last365days, /alltime\n"
-        "Example: /last30days full\n\n"
-        "Custom range:\n"
-        "/statsrange YYYY-MM-DD YYYY-MM-DD [compact|full]\n"
-        "Example: /statsrange 2024-11-01 2024-11-15 compact\n\n"
-        "Note: totals are stored in Supabase, so they survive restarts. "
-        "Each Telegram chat (driver group) is tracked separately."
+        "How it works:\n"
+        "• Dispatcher posts messages with orders (locations + $ amounts).\n"
+        "• I extract those orders and save them as *pending*.\n"
+        "• When the driver confirms (text like 'send it', 'coming', 'I'll take it' or emoji like 👍❤️✔️), "
+        "I mark those orders as *accepted*.\n"
+        "• Rejections like 'can't', 'nah', or 👎 mark them as *rejected*.\n"
+        "• Only *accepted* orders count toward totals & stats.\n\n"
+        "Commands:\n"
+        "/today – accepted orders today\n"
+        "/totals – this calendar week (since Monday)\n"
+        "/last7days – last 7 days\n"
+        "/last30days – last 30 days\n"
+        "/alltime – all accepted orders ever\n"
+        "/pending – show recent pending orders\n"
+        "/mode full|medium|compact – change summary detail\n"
+        "/help – show this again"
     )
     if update.message:
         await update.message.reply_text(msg)
@@ -635,10 +551,37 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    args = context.args
+    if not args:
+        cfg = get_chat_config(chat_id)
+        await message.reply_text(
+            f"Current summary mode: {cfg['summary_mode']}\n"
+            "Options: full, medium, compact\n"
+            "Example: /mode compact"
+        )
+        return
+
+    choice = args[0].lower()
+    if choice not in ("full", "medium", "compact"):
+        await message.reply_text("Invalid mode. Use one of: full, medium, compact.")
+        return
+
+    cfg = get_chat_config(chat_id)
+    cfg["summary_mode"] = choice
+    await message.reply_text(f"Summary mode set to: {choice}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle any non-command text message.
-    We call OpenAI to extract orders and store them in Supabase for this chat.
+    1) Try to interpret as confirmation/rejection for pending orders.
+    2) If not, try to extract new orders from dispatcher text.
     """
     message = update.message
     if not message or not message.text:
@@ -646,300 +589,131 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = message.chat_id
     text = message.text
-    chat_state = get_chat_state(chat_id)
 
+    # 1) intent classification
+    intent = classify_intent(text)
+    if intent in ("accept", "reject"):
+        pending = supabase_fetch_pending(chat_id, limit=5)
+        if not pending:
+            # nothing to apply this to
+            return
+
+        order_ids = match_orders_for_message(text, pending)
+        if not order_ids:
+            return
+
+        new_status = "accepted" if intent == "accept" else "rejected"
+        supabase_update_status(order_ids, new_status)
+
+        # small confirmation message
+        affected = [o for o in pending if o["id"] in order_ids]
+        parts = [f"{a['location']} ${float(a['amount']):.2f}" for a in affected]
+        joined = ", ".join(parts)
+        await message.reply_text(
+            f"Marked as *{new_status}*: {joined}", parse_mode="Markdown"
+        )
+        return
+
+    # 2) Maybe it's a dispatcher message with new orders
     msg_time = message.date
     if msg_time.tzinfo is None:
-        msg_time = msg_time.replace(tzinfo=UTC)
+        msg_time = msg_time.replace(tzinfo=ZoneInfo("UTC"))
+    msg_time_utc = msg_time.astimezone(ZoneInfo("UTC"))
 
     orders = await extract_orders_from_text(text)
     if not orders:
         return
 
-    # Decide which week this order belongs to (hybrid: manual or calendar week).
-    now_utc = datetime.now(tz=UTC)
-    if chat_state["manual_active"] and chat_state["manual_start"] is not None:
-        week_start_utc = chat_state["manual_start"]
-    else:
-        week_start_utc = last_monday_start(now_utc)
-
+    # Insert as pending
+    supabase_insert_orders(chat_id, orders, msg_time_utc)
+    lines = [f"Stored {len(orders)} pending order(s):"]
     for o in orders:
-        save_order_to_supabase(
-            chat_id=chat_id,
-            msg_time=msg_time,
-            location=o["location"],
-            amount=o["amount"],
-            week_start_utc=week_start_utc,
-        )
-
-    logger.info(
-        f"Chat {chat_id}: stored {len(orders)} orders from message {message.message_id}"
-    )
+        lines.append(f"- {o['location']}: ${float(o['amount']):.2f}")
+    await message.reply_text("\n".join(lines))
 
 
-async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /totals – show detailed orders for the current hybrid week period.
-    """
-    message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat_id
-    chat_state = get_chat_state(chat_id)
-
-    start, end, label = get_week_period(chat_state)
-    orders = fetch_orders_from_supabase(chat_id, start, end)
-    text = format_orders_grouped_by_weekday_per_order(orders, label)
-    await message.reply_text(text)
-
-
-async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await totals_command(update, context)
-
-
-async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /today – show today’s orders.
-    """
-    message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat_id
-    start, end, day_name = get_today_bounds()
-    orders = fetch_orders_from_supabase(chat_id, start, end)
-    label = f"TODAY ({day_name})"
-    text = format_orders_grouped_by_weekday_per_order(orders, label)
-    await message.reply_text(text)
-
-
-async def yesterday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /yesterday – show yesterday’s orders.
-    """
-    message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat_id
-    start, end, day_name = get_yesterday_bounds()
-    orders = fetch_orders_from_supabase(chat_id, start, end)
-    label = f"YESTERDAY ({day_name})"
-    text = format_orders_grouped_by_weekday_per_order(orders, label)
-    await message.reply_text(text)
-
-
-async def revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /revenue – daily totals for the current hybrid week period (medium summary).
-    """
-    message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat_id
-    chat_state = get_chat_state(chat_id)
-
-    start, end, label = get_week_period(chat_state)
-    orders = fetch_orders_from_supabase(chat_id, start, end)
-    text = summarize_orders_range(orders, f"REVENUE – {label}", detail_level="medium")
-    await message.reply_text(text)
-
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /stats – summary stats for the current hybrid week period (medium summary).
-    """
-    message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat_id
-    chat_state = get_chat_state(chat_id)
-
-    start, end, label = get_week_period(chat_state)
-    orders = fetch_orders_from_supabase(chat_id, start, end)
-    text = summarize_orders_range(orders, label, detail_level="medium")
-    await message.reply_text(text)
-
-
-async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /orders – alias for /totals.
-    """
-    await totals_command(update, context)
-
-
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /clear – clear all stored data for this chat (in Supabase + in-memory state).
-    """
-    message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat_id
-    clear_orders_for_chat(chat_id)
-    CHAT_STATE[chat_id] = {"manual_active": False, "manual_start": None}
-    await message.reply_text("All stored orders and week settings for this chat have been cleared.")
-
-
-async def startweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /startweek – start a new manual payout week from now (UTC).
-    """
-    message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat_id
-    chat_state = get_chat_state(chat_id)
-
-    now_utc = datetime.now(tz=UTC)
-    chat_state["manual_active"] = True
-    chat_state["manual_start"] = now_utc
-
-    await message.reply_text(
-        "Manual week started from *now*.\n"
-        "I'll track orders from this point until you run /endweek.",
-        parse_mode="Markdown",
-    )
-
-
-async def endweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /endweek – finalize the current manual week, show totals,
-    and return to automatic calendar-week mode.
-    """
-    message = update.message
-    if not message:
-        return
-
-    chat_id = message.chat_id
-    chat_state = get_chat_state(chat_id)
-
-    if not chat_state["manual_active"] or chat_state["manual_start"] is None:
-        await message.reply_text(
-            "No manual week is currently active. Use /startweek to begin one."
-        )
-        return
-
-    start = chat_state["manual_start"]
-    now_utc = datetime.now(tz=UTC)
-
-    orders = fetch_orders_from_supabase(chat_id, start, now_utc)
-    text = format_orders_grouped_by_weekday_per_order(orders, "MANUAL WEEK FINAL TOTALS")
-
-    chat_state["manual_active"] = False
-    chat_state["manual_start"] = None
-
-    await message.reply_text(text)
-
-
-# ====== RANGE STATS COMMANDS (last7days, alltime, statsrange, etc.) ======
-
-async def handle_last_ndays(
+async def generic_range_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    n_days: int,
+    label: str,
+    start_utc: datetime,
+    end_utc: Optional[datetime] = None,
 ):
     message = update.message
     if not message:
         return
 
     chat_id = message.chat_id
-    detail_level = parse_detail_level(context.args)
-    start, end = get_last_n_days_bounds(n_days)
-    orders = fetch_orders_from_supabase(chat_id, start, end)
-    label = f"LAST {n_days} DAYS (including today)"
-    text = summarize_orders_range(orders, label, detail_level)
+    cfg = get_chat_config(chat_id)
+
+    if end_utc is None:
+        end_utc = datetime.now(tz=ZoneInfo("UTC"))
+
+    orders = supabase_fetch_orders(
+        chat_id=chat_id,
+        status="accepted",
+        start_utc=start_utc,
+        end_utc=end_utc,
+        limit=None,
+        order_desc=False,
+    )
+
+    text = summarize_orders(orders, label, summary_mode=cfg["summary_mode"])
     await message.reply_text(text)
 
 
-async def last7days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_last_ndays(update, context, 7)
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start = start_of_today_utc()
+    await generic_range_command(update, context, "TODAY (accepted orders)", start)
 
 
-async def last14days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_last_ndays(update, context, 14)
+async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start = start_of_week_utc()
+    await generic_range_command(
+        update, context, "THIS WEEK (since Monday, accepted orders)", start
+    )
 
 
-async def last30days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_last_ndays(update, context, 30)
+async def last7_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start = days_ago_utc(7)
+    await generic_range_command(
+        update, context, "LAST 7 DAYS (accepted orders)", start
+    )
 
 
-async def last60days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_last_ndays(update, context, 60)
-
-
-async def last90days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_last_ndays(update, context, 90)
-
-
-async def last180days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_last_ndays(update, context, 180)
-
-
-async def last365days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_last_ndays(update, context, 365)
+async def last30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start = days_ago_utc(30)
+    await generic_range_command(
+        update, context, "LAST 30 DAYS (accepted orders)", start
+    )
 
 
 async def alltime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # effectively from far past
+    start = datetime(2000, 1, 1, tzinfo=ZoneInfo("UTC"))
+    await generic_range_command(update, context, "ALL-TIME (accepted orders)", start)
+
+
+async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
-
     chat_id = message.chat_id
-    detail_level = parse_detail_level(context.args)
 
-    orders = fetch_all_orders(chat_id)
-    label = "ALL-TIME TOTALS FOR THIS CHAT"
-    text = summarize_orders_range(orders, label, detail_level)
-    await message.reply_text(text)
-
-
-async def statsrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /statsrange YYYY-MM-DD YYYY-MM-DD [compact|full]
-    """
-    message = update.message
-    if not message:
+    pending = supabase_fetch_pending(chat_id, limit=10)
+    if not pending:
+        await message.reply_text("No pending orders for this chat.")
         return
 
-    args = context.args
-    if len(args) < 2:
-        await message.reply_text(
-            "Usage: /statsrange YYYY-MM-DD YYYY-MM-DD [compact|full]"
+    lines = ["Recent pending orders:"]
+    for o in pending:
+        ts = datetime.fromisoformat(o["order_timestamp"].replace("Z", "+00:00"))
+        local_ts = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"- #{o['id']} {o['location']} ${float(o['amount']):.2f} ({local_ts})"
         )
-        return
 
-    date_str1 = args[0]
-    date_str2 = args[1]
-    detail_level = parse_detail_level(args[2:]) if len(args) > 2 else "medium"
-
-    try:
-        d1 = datetime.strptime(date_str1, "%Y-%m-%d").date()
-        d2 = datetime.strptime(date_str2, "%Y-%m-%d").date()
-    except ValueError:
-        await message.reply_text("Dates must be in YYYY-MM-DD format.")
-        return
-
-    if d2 < d1:
-        d1, d2 = d2, d1
-
-    start_local = datetime(d1.year, d1.month, d1.day, 0, 0, 0, tzinfo=TIMEZONE)
-    # end inclusive: end of d2 (23:59:59)
-    end_local = datetime(d2.year, d2.month, d2.day, 23, 59, 59, tzinfo=TIMEZONE)
-
-    start_utc = start_local.astimezone(UTC)
-    end_utc = end_local.astimezone(UTC)
-
-    chat_id = message.chat_id
-    orders = fetch_orders_from_supabase(chat_id, start_utc, end_utc)
-    label = f"CUSTOM STATS ({d1.isoformat()} → {d2.isoformat()})"
-    text = summarize_orders_range(orders, label, detail_level)
-    await message.reply_text(text)
+    await message.reply_text("\n".join(lines))
 
 
 # ============= MAIN =============
@@ -950,40 +724,23 @@ def main():
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables are not set.")
+        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_KEY is not set.")
 
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Core commands
+    # commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("totals", totals_command))
-    application.add_handler(CommandHandler("week", week_command))
+    application.add_handler(CommandHandler("mode", mode_command))
+
     application.add_handler(CommandHandler("today", today_command))
-    application.add_handler(CommandHandler("yesterday", yesterday_command))
-    application.add_handler(CommandHandler("revenue", revenue_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("orders", orders_command))
-    application.add_handler(CommandHandler("clear", clear_command))
-    application.add_handler(CommandHandler("startweek", startweek_command))
-    application.add_handler(CommandHandler("endweek", endweek_command))
-
-    # Range/stat commands
-    application.add_handler(CommandHandler("last7days", last7days_command))
-    application.add_handler(CommandHandler("last14days", last14days_command))
-    application.add_handler(CommandHandler("last30days", last30days_command))
-    application.add_handler(CommandHandler("last60days", last60days_command))
-    application.add_handler(CommandHandler("last90days", last90days_command))
-    application.add_handler(CommandHandler("last180days", last180days_command))
-    application.add_handler(CommandHandler("last365days", last365days_command))
+    application.add_handler(CommandHandler("totals", totals_command))
+    application.add_handler(CommandHandler("last7days", last7_command))
+    application.add_handler(CommandHandler("last30days", last30_command))
     application.add_handler(CommandHandler("alltime", alltime_command))
-    application.add_handler(CommandHandler("statsrange", statsrange_command))
+    application.add_handler(CommandHandler("pending", pending_command))
 
-    # Message handler for orders
+    # messages (non-commands)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
