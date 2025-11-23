@@ -29,6 +29,8 @@ MAX_ORDERS_MEMORY = 1000
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4o-mini"
 
+WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
 # logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 # In-memory state (no external DB)
 # CHAT_STATE[chat_id] = {
-#   "orders": [ { "timestamp": datetime, "location": str, "amount": float } ],
+#   "orders": [ { "timestamp": datetime, "location": str, "amount": float, "weekday": str } ],
 #   "manual_active": bool,
 #   "manual_start": datetime | None,
 # }
@@ -197,43 +199,144 @@ def prune_old_orders(chat_state: Dict[str, Any]):
         chat_state["orders"] = orders[-MAX_ORDERS_MEMORY:]
 
 
-def compute_totals(
+def filter_orders_in_range(
     chat_state: Dict[str, Any],
     start: datetime,
     end: Optional[datetime] = None,
-):
+) -> List[Dict[str, Any]]:
     """
-    Sum amounts per location between [start, end].
-    end can be None = now.
+    Return all orders between [start, end], sorted oldest -> newest.
     """
     if end is None:
         end = datetime.now(tz=ZoneInfo("UTC"))
 
-    per_location: Dict[str, float] = {}
-    grand_total = 0.0
-
+    result = []
     for order in chat_state["orders"]:
         ts = order["timestamp"]
-        if ts < start or ts > end:
-            continue
-        loc = order["location"]
-        amt = order["amount"]
-        per_location[loc] = per_location.get(loc, 0.0) + amt
-        grand_total += amt
+        if start <= ts <= end:
+            result.append(order)
 
-    return per_location, grand_total
+    # sort by timestamp oldest -> newest
+    result.sort(key=lambda o: o["timestamp"])
+    return result
 
 
-def format_totals_message(per_location: Dict[str, float], grand_total: float, label: str) -> str:
-    if not per_location:
+def group_orders_by_weekday(orders: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Group orders by weekday name (Monday, Tuesday, ...).
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for order in orders:
+        day = order.get("weekday")
+        if not day:
+            # fallback if missing
+            day = order["timestamp"].astimezone(TIMEZONE).strftime("%A")
+        grouped.setdefault(day, []).append(order)
+    return grouped
+
+
+def format_orders_grouped_by_weekday(orders: List[Dict[str, Any]], label: str) -> str:
+    """
+    Format a detailed list of orders grouped by weekday, oldest -> newest,
+    with a weekly total at the bottom.
+    """
+    if not orders:
         return f"{label} – No orders found in this period."
 
-    lines = [label]
-    for loc, amt in sorted(per_location.items()):
-        lines.append(f"{loc}: ${amt:.2f}")
+    grouped = group_orders_by_weekday(orders)
+    total = sum(o["amount"] for o in orders)
+
+    lines: List[str] = [label, ""]
+    for day in WEEKDAY_ORDER:
+        day_orders = grouped.get(day, [])
+        if not day_orders:
+            continue
+        lines.append(day.upper())
+        for o in day_orders:
+            lines.append(f"• {o['location']} — ${o['amount']:.2f}")
+        lines.append("")  # blank line between days
+
+    lines.append(f"TOTAL FOR PERIOD: ${total:.2f}")
+    return "\n".join(lines).rstrip()
+
+
+def format_revenue_by_day(orders: List[Dict[str, Any]], label: str) -> str:
+    """
+    Format daily totals (per weekday) and weekly total.
+    """
+    if not orders:
+        return f"{label} – No orders found in this period."
+
+    grouped = group_orders_by_weekday(orders)
+    day_totals: Dict[str, float] = {}
+    for day, day_orders in grouped.items():
+        day_totals[day] = sum(o["amount"] for o in day_orders)
+
+    grand_total = sum(day_totals.values())
+
+    lines: List[str] = [label]
+    for day in WEEKDAY_ORDER:
+        if day in day_totals:
+            lines.append(f"{day}: ${day_totals[day]:.2f}")
     lines.append("")
-    lines.append(f"TOTAL: ${grand_total:.2f}")
+    lines.append(f"TOTAL FOR PERIOD: ${grand_total:.2f}")
     return "\n".join(lines)
+
+
+def compute_stats(orders: List[Dict[str, Any]]) -> str:
+    """
+    Compute simple stats for a set of orders.
+    """
+    if not orders:
+        return "No orders found in this period."
+
+    amounts = [o["amount"] for o in orders]
+    total = sum(amounts)
+    count = len(amounts)
+    avg = total / count if count > 0 else 0.0
+    max_amt = max(amounts)
+    min_amt = min(amounts)
+
+    return (
+        f"STATS FOR PERIOD\n"
+        f"Total Orders: {count}\n"
+        f"Total Amount: ${total:.2f}\n"
+        f"Average Order: ${avg:.2f}\n"
+        f"Largest Order: ${max_amt:.2f}\n"
+        f"Smallest Order: ${min_amt:.2f}"
+    )
+
+
+def get_week_period(chat_state: Dict[str, Any]):
+    """
+    Return (start, end, label) for the current period:
+    - Manual week if active
+    - Otherwise calendar week since Monday 00:00 (business timezone)
+    """
+    now_utc = datetime.now(tz=ZoneInfo("UTC"))
+    if chat_state["manual_active"] and chat_state["manual_start"] is not None:
+        start = chat_state["manual_start"]
+        label = "MANUAL WEEK TOTALS"
+    else:
+        start = last_monday_start(now_utc)
+        label = "CALENDAR WEEK TOTALS (since Monday 00:00)"
+    return start, now_utc, label
+
+
+def get_today_bounds():
+    now_local = datetime.now(tz=TIMEZONE)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(ZoneInfo("UTC")), end_local.astimezone(ZoneInfo("UTC")), now_local.strftime("%A")
+
+
+def get_yesterday_bounds():
+    now_local = datetime.now(tz=TIMEZONE)
+    today_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local = today_start_local - timedelta(days=1)
+    end_local = today_start_local
+    day_name = start_local.strftime("%A")
+    return start_local.astimezone(ZoneInfo("UTC")), end_local.astimezone(ZoneInfo("UTC")), day_name
 
 
 # ============= HANDLERS =============
@@ -246,13 +349,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• I have largo $27 1-2 can go early and Alexandria $30 2-3\n"
         "• Adding Woodbridge to route for $35\n\n"
         "Then I extract the location + amount and keep a running tally.\n\n"
-        "Commands:\n"
-        "/totals – show current period totals (manual week if active, otherwise this calendar week)\n"
+        "Core commands:\n"
+        "/totals – detailed list for current week/manual period grouped by weekday\n"
         "/week – same as /totals\n"
+        "/today – today’s orders only\n"
+        "/yesterday – yesterday’s orders only\n"
+        "/revenue – daily totals for the current week/manual period\n"
+        "/stats – summary stats for the current week/manual period\n"
+        "/orders – full detailed log for the current week/manual period\n"
         "/startweek – start a manual payout week (overrides auto calendar week)\n"
         "/endweek – end the current manual week and show totals\n"
+        "/clear – clear all stored data for this chat\n"
         "/help – show this message again\n\n"
-        "Note: totals are in-memory only. If the bot is restarted or redeployed, counters reset."
+        "Note: totals are in-memory only. If the bot is restarted or redeployed, counters reset. "
+        "Each Telegram chat (driver group) is tracked separately."
     )
     if update.message:
         await update.message.reply_text(msg)
@@ -284,11 +394,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for o in orders:
+        # Determine weekday in your business timezone
+        weekday = msg_time.astimezone(TIMEZONE).strftime("%A")
+
         chat_state["orders"].append(
             {
                 "timestamp": msg_time,
                 "location": o["location"],
                 "amount": o["amount"],
+                "weekday": weekday,
             }
         )
 
@@ -300,9 +414,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /totals – show totals for:
+    /totals – show detailed orders for:
     - If manual week active: from manual_start .. now
     - Else: from last Monday 00:00 (business timezone) .. now
+    Grouped by weekday, oldest -> newest.
     """
     message = update.message
     if not message:
@@ -311,22 +426,113 @@ async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = message.chat_id
     chat_state = get_chat_state(chat_id)
 
-    now_utc = datetime.now(tz=ZoneInfo("UTC"))
-
-    if chat_state["manual_active"] and chat_state["manual_start"] is not None:
-        start = chat_state["manual_start"]
-        label = "MANUAL WEEK TOTALS"
-    else:
-        start = last_monday_start(now_utc)
-        label = "CALENDAR WEEK TOTALS (since Monday 00:00)"
-
-    per_location, grand_total = compute_totals(chat_state, start=start, end=now_utc)
-    text = format_totals_message(per_location, grand_total, label)
+    start, end, label = get_week_period(chat_state)
+    orders = filter_orders_in_range(chat_state, start, end)
+    text = format_orders_grouped_by_weekday(orders, label)
     await message.reply_text(text)
 
 
 async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # alias of /totals
     await totals_command(update, context)
+
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /today – show today’s orders grouped by weekday (single day) oldest -> newest.
+    """
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    chat_state = get_chat_state(chat_id)
+
+    start, end, day_name = get_today_bounds()
+    orders = filter_orders_in_range(chat_state, start, end)
+    label = f"TODAY ({day_name})"
+    text = format_orders_grouped_by_weekday(orders, label)
+    await message.reply_text(text)
+
+
+async def yesterday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /yesterday – show yesterday’s orders grouped by weekday (single day) oldest -> newest.
+    """
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    chat_state = get_chat_state(chat_id)
+
+    start, end, day_name = get_yesterday_bounds()
+    orders = filter_orders_in_range(chat_state, start, end)
+    label = f"YESTERDAY ({day_name})"
+    text = format_orders_grouped_by_weekday(orders, label)
+    await message.reply_text(text)
+
+
+async def revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /revenue – daily totals for the current week/manual period.
+    """
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    chat_state = get_chat_state(chat_id)
+
+    start, end, label = get_week_period(chat_state)
+    orders = filter_orders_in_range(chat_state, start, end)
+    text = format_revenue_by_day(orders, f"REVENUE BY DAY – {label}")
+    await message.reply_text(text)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /stats – summary stats for the current week/manual period.
+    """
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    chat_state = get_chat_state(chat_id)
+
+    start, end, label = get_week_period(chat_state)
+    orders = filter_orders_in_range(chat_state, start, end)
+    stats_text = compute_stats(orders)
+    text = f"{label}\n\n{stats_text}"
+    await message.reply_text(text)
+
+
+async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /orders – full detailed log for current week/manual period (same as /totals, but explicit).
+    """
+    await totals_command(update, context)
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /clear – clear all stored data for this chat.
+    """
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    CHAT_STATE[chat_id] = {
+        "orders": [],
+        "manual_active": False,
+        "manual_start": None,
+    }
+
+    await message.reply_text(
+        "All stored orders and week settings for this chat have been cleared."
+    )
 
 
 async def startweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,12 +576,13 @@ async def endweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    now_utc = datetime.now(tz=ZoneInfo("UTC"))
     start = chat_state["manual_start"]
+    now_utc = datetime.now(tz=ZoneInfo("UTC"))
 
-    per_location, grand_total = compute_totals(chat_state, start=start, end=now_utc)
-    text = format_totals_message(per_location, grand_total, "MANUAL WEEK FINAL TOTALS")
+    orders = filter_orders_in_range(chat_state, start, now_utc)
+    text = format_orders_grouped_by_weekday(orders, "MANUAL WEEK FINAL TOTALS")
 
+    # reset manual mode
     chat_state["manual_active"] = False
     chat_state["manual_start"] = None
 
@@ -400,6 +607,12 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("totals", totals_command))
     application.add_handler(CommandHandler("week", week_command))
+    application.add_handler(CommandHandler("today", today_command))
+    application.add_handler(CommandHandler("yesterday", yesterday_command))
+    application.add_handler(CommandHandler("revenue", revenue_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("orders", orders_command))
+    application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("startweek", startweek_command))
     application.add_handler(CommandHandler("endweek", endweek_command))
 
