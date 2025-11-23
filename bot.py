@@ -1,9 +1,9 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 from telegram import Update
@@ -23,25 +23,22 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-# REST endpoint for your "orders" table
 SUPABASE_ORDERS_URL = (
     f"{SUPABASE_URL.rstrip('/')}/rest/v1/orders" if SUPABASE_URL else None
 )
 
-# If your column name is not "order_timestamp", change this to match exactly.
+# Column name in Supabase for the order timestamp
 SUPABASE_ORDER_TS_COLUMN = "order_timestamp"
 
-# timezone for weekly logic (your business timezone)
 TIMEZONE = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
-
-# max rows we ever expect (just for sanity in some queries)
-MAX_ROWS_PER_QUERY = 5000
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4o-mini"
 
 WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+MAX_ROWS_PER_QUERY = 10000
 
 # logging
 logging.basicConfig(
@@ -195,6 +192,7 @@ def supabase_headers() -> Dict[str, str]:
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "Prefer": "return=minimal",
     }
 
 
@@ -203,7 +201,6 @@ def save_order_to_supabase(
     msg_time: datetime,
     location: str,
     amount: float,
-    weekday: str,
     week_start_utc: datetime,
 ):
     """
@@ -218,7 +215,6 @@ def save_order_to_supabase(
             "chat_id": str(chat_id),
             "location": location,
             "amount": amount,
-            "weekday": weekday,
             "week_start": week_start_utc.astimezone(UTC).isoformat(),
             SUPABASE_ORDER_TS_COLUMN: msg_time.astimezone(UTC).isoformat(),
         }
@@ -240,17 +236,16 @@ def fetch_orders_from_supabase(
     end_utc: datetime,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch orders for a given chat between [start_utc, end_utc), sorted oldest -> newest.
+    Fetch orders for a given chat between [start_utc, end_utc], sorted oldest -> newest.
     """
     if not SUPABASE_ORDERS_URL:
         logger.error("SUPABASE_URL is not set.")
         return []
 
-    # Supabase REST filters: we need two conditions on the timestamp column.
     params = [
         ("chat_id", f"eq.{chat_id}"),
         (SUPABASE_ORDER_TS_COLUMN, f"gte.{start_utc.astimezone(UTC).isoformat()}"),
-        (SUPABASE_ORDER_TS_COLUMN, f"lt.{end_utc.astimezone(UTC).isoformat()}"),
+        (SUPABASE_ORDER_TS_COLUMN, f"lte.{end_utc.astimezone(UTC).isoformat()}"),
         ("order", f"{SUPABASE_ORDER_TS_COLUMN}.asc"),
         ("limit", str(MAX_ROWS_PER_QUERY)),
     ]
@@ -264,12 +259,15 @@ def fetch_orders_from_supabase(
         )
         resp.raise_for_status()
         data = resp.json()
-        # Normalize keys to what the rest of the code expects
         orders: List[Dict[str, Any]] = []
         for row in data:
             try:
                 ts_str = row.get(SUPABASE_ORDER_TS_COLUMN)
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")) if ts_str else None
+                ts = (
+                    datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    if ts_str
+                    else None
+                )
                 if ts is None:
                     continue
                 orders.append(
@@ -277,7 +275,6 @@ def fetch_orders_from_supabase(
                         "timestamp": ts,
                         "location": row.get("location", ""),
                         "amount": float(row.get("amount", 0) or 0),
-                        "weekday": row.get("weekday", ""),
                     }
                 )
             except Exception:
@@ -286,6 +283,71 @@ def fetch_orders_from_supabase(
     except Exception as e:
         logger.error(f"Error fetching orders from Supabase: {e}")
         return []
+
+
+def fetch_all_orders(chat_id: int) -> List[Dict[str, Any]]:
+    """
+    Fetch ALL orders for this chat.
+    """
+    if not SUPABASE_ORDERS_URL:
+        logger.error("SUPABASE_URL is not set.")
+        return []
+
+    params = [
+        ("chat_id", f"eq.{chat_id}"),
+        ("order", f"{SUPABASE_ORDER_TS_COLUMN}.asc"),
+        ("limit", str(MAX_ROWS_PER_QUERY)),
+    ]
+
+    try:
+        resp = requests.get(
+            SUPABASE_ORDERS_URL,
+            headers=supabase_headers(),
+            params=params,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        orders: List[Dict[str, Any]] = []
+        for row in data:
+            try:
+                ts_str = row.get(SUPABASE_ORDER_TS_COLUMN)
+                ts = (
+                    datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    if ts_str
+                    else None
+                )
+                if ts is None:
+                    continue
+                orders.append(
+                    {
+                        "timestamp": ts,
+                        "location": row.get("location", ""),
+                        "amount": float(row.get("amount", 0) or 0),
+                    }
+                )
+            except Exception:
+                continue
+        return orders
+    except Exception as e:
+        logger.error(f"Error fetching all orders from Supabase: {e}")
+        return []
+
+
+def clear_orders_for_chat(chat_id: int) -> None:
+    if not SUPABASE_ORDERS_URL:
+        return
+    try:
+        params = [("chat_id", f"eq.{chat_id}")]
+        resp = requests.delete(
+            SUPABASE_ORDERS_URL,
+            headers=supabase_headers(),
+            params=params,
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"Error clearing orders for chat {chat_id}: {e}")
 
 
 # ============= DATE HELPERS =============
@@ -303,10 +365,10 @@ def last_monday_start(now_utc: datetime) -> datetime:
     return monday_local.astimezone(UTC)
 
 
-def get_week_period(chat_state: Dict[str, Any]):
+def get_week_period(chat_state: Dict[str, Any]) -> Tuple[datetime, datetime, str]:
     """
     Return (start_utc, end_utc, label) for the current period:
-    Hybrid logic (Option C):
+    Hybrid logic:
     - If manual week active: from manual_start .. now
     - Else: calendar week since Monday 00:00 (business timezone) .. now
     """
@@ -320,14 +382,14 @@ def get_week_period(chat_state: Dict[str, Any]):
     return start, now_utc, label
 
 
-def get_today_bounds():
+def get_today_bounds() -> Tuple[datetime, datetime, str]:
     now_local = datetime.now(tz=TIMEZONE)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     end_local = start_local + timedelta(days=1)
     return start_local.astimezone(UTC), end_local.astimezone(UTC), now_local.strftime("%A")
 
 
-def get_yesterday_bounds():
+def get_yesterday_bounds() -> Tuple[datetime, datetime, str]:
     now_local = datetime.now(tz=TIMEZONE)
     today_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     start_local = today_start_local - timedelta(days=1)
@@ -336,20 +398,36 @@ def get_yesterday_bounds():
     return start_local.astimezone(UTC), end_local.astimezone(UTC), day_name
 
 
+def get_last_n_days_bounds(n: int) -> Tuple[datetime, datetime]:
+    """
+    Inclusive of today.
+    Example: n=7 → today + previous 6 full days.
+    """
+    now_local = datetime.now(tz=TIMEZONE)
+    today_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local = today_start_local - timedelta(days=n - 1)
+    start_utc = start_local.astimezone(UTC)
+    end_utc = now_local.astimezone(UTC)
+    return start_utc, end_utc
+
+
+# ============= STATS & FORMATTING HELPERS =============
+
 def group_orders_by_weekday(orders: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for order in orders:
-        day = order.get("weekday")
-        if not day:
-            day = order["timestamp"].astimezone(TIMEZONE).strftime("%A")
+        ts_local = order["timestamp"].astimezone(TIMEZONE)
+        day = ts_local.strftime("%A")
         grouped.setdefault(day, []).append(order)
     return grouped
 
 
-def format_orders_grouped_by_weekday(orders: List[Dict[str, Any]], label: str) -> str:
+def format_orders_grouped_by_weekday_per_order(
+    orders: List[Dict[str, Any]],
+    label: str,
+) -> str:
     """
-    Format a detailed list of orders grouped by weekday, oldest -> newest,
-    with a period total at the bottom.
+    Used for /totals-style weekly view: lists each order grouped by weekday.
     """
     if not orders:
         return f"{label} – No orders found in this period."
@@ -371,51 +449,154 @@ def format_orders_grouped_by_weekday(orders: List[Dict[str, Any]], label: str) -
     return "\n".join(lines).rstrip()
 
 
-def format_revenue_by_day(orders: List[Dict[str, Any]], label: str) -> str:
-    """
-    Format daily totals (per weekday) and period total.
-    """
-    if not orders:
-        return f"{label} – No orders found in this period."
-
-    grouped = group_orders_by_weekday(orders)
-    day_totals: Dict[str, float] = {}
-    for day, day_orders in grouped.items():
-        day_totals[day] = sum(o["amount"] for o in day_orders)
-
-    grand_total = sum(day_totals.values())
-
-    lines: List[str] = [label]
-    for day in WEEKDAY_ORDER:
-        if day in day_totals:
-            lines.append(f"{day}: ${day_totals[day]:.2f}")
-    lines.append("")
-    lines.append(f"TOTAL FOR PERIOD: ${grand_total:.2f}")
-    return "\n".join(lines)
-
-
-def compute_stats(orders: List[Dict[str, Any]]) -> str:
-    if not orders:
-        return "No orders found in this period."
-
+def compute_basic_stats(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
     amounts = [o["amount"] for o in orders]
     total = sum(amounts)
     count = len(amounts)
-    avg = total / count if count > 0 else 0.0
-    max_amt = max(amounts)
-    min_amt = min(amounts)
-
-    return (
-        f"STATS FOR PERIOD\n"
-        f"Total Orders: {count}\n"
-        f"Total Amount: ${total:.2f}\n"
-        f"Average Order: ${avg:.2f}\n"
-        f"Largest Order: ${max_amt:.2f}\n"
-        f"Smallest Order: ${min_amt:.2f}"
-    )
+    avg = total / count if count else 0.0
+    max_amt = max(amounts) if amounts else 0.0
+    min_amt = min(amounts) if amounts else 0.0
+    return {
+        "total_orders": count,
+        "total_amount": total,
+        "avg_order": avg,
+        "max_order": max_amt,
+        "min_order": min_amt,
+    }
 
 
-# ============= HANDLERS =============
+def compute_daily_totals(orders: List[Dict[str, Any]]) -> Dict[date, float]:
+    """
+    Aggregate revenue by calendar date (local TZ).
+    """
+    by_day: Dict[date, float] = {}
+    for o in orders:
+        d = o["timestamp"].astimezone(TIMEZONE).date()
+        by_day[d] = by_day.get(d, 0.0) + o["amount"]
+    return by_day
+
+
+def compute_location_stats(orders: List[Dict[str, Any]]) -> Tuple[Dict[str, int], Dict[str, float]]:
+    """
+    Returns (counts_by_location, revenue_by_location)
+    """
+    counts: Dict[str, int] = {}
+    revenue: Dict[str, float] = {}
+    for o in orders:
+        loc = o["location"] or "Unknown"
+        counts[loc] = counts.get(loc, 0) + 1
+        revenue[loc] = revenue.get(loc, 0.0) + o["amount"]
+    return counts, revenue
+
+
+def summarize_orders_range(
+    orders: List[Dict[str, Any]],
+    label: str,
+    detail_level: str = "medium",
+) -> str:
+    """
+    Generic summary for any date range.
+    detail_level: "compact" | "medium" | "full"
+    """
+    if not orders:
+        return f"{label}\n\nNo orders found in this period."
+
+    stats = compute_basic_stats(orders)
+    daily_totals = compute_daily_totals(orders)
+    counts_by_loc, revenue_by_loc = compute_location_stats(orders)
+
+    days_count = len(daily_totals)
+    avg_per_day = stats["total_amount"] / days_count if days_count else 0.0
+
+    # Busiest / slowest day by revenue
+    busiest_day = None
+    slowest_day = None
+    if daily_totals:
+        busiest_day = max(daily_totals.items(), key=lambda x: x[1])
+        slowest_day = min(daily_totals.items(), key=lambda x: x[1])
+
+    def fmt_day(d: date, amount: float) -> str:
+        weekday = d.strftime("%A")
+        return f"{weekday} {d.isoformat()} – ${amount:.2f}"
+
+    # Top locations by count
+    sorted_locs = sorted(counts_by_loc.items(), key=lambda x: x[1], reverse=True)
+    total_orders = stats["total_orders"]
+
+    lines: List[str] = [label, ""]
+
+    # Shared core info
+    lines.append(f"Total Orders: {stats['total_orders']}")
+    lines.append(f"Total Revenue: ${stats['total_amount']:.2f}")
+    lines.append(f"Average Order: ${stats['avg_order']:.2f}")
+    lines.append(f"Average Revenue Per Day: ${avg_per_day:.2f}")
+    lines.append(f"Largest Order: ${stats['max_order']:.2f}")
+    lines.append(f"Smallest Order: ${stats['min_order']:.2f}")
+
+    if busiest_day:
+        lines.append(
+            f"Busiest Day: {fmt_day(busiest_day[0], busiest_day[1])}"
+        )
+    if slowest_day and slowest_day != busiest_day:
+        lines.append(
+            f"Slowest Day: {fmt_day(slowest_day[0], slowest_day[1])}"
+        )
+
+    # Compact: stop here
+    if detail_level == "compact":
+        return "\n".join(lines)
+
+    # Medium & Full: add top locations
+    lines.append("")
+    lines.append("Top Locations:")
+    top_n = 3 if detail_level == "medium" else len(sorted_locs)
+    for loc, cnt in sorted_locs[:top_n]:
+        pct = (cnt / total_orders) * 100 if total_orders else 0.0
+        lines.append(f"• {loc} – {cnt} orders ({pct:.1f}%)")
+
+    # Medium: add short revenue-by-day (sorted high → low)
+    if detail_level == "medium":
+        lines.append("")
+        lines.append("Revenue by Day (top 7):")
+        for d, amt in sorted(daily_totals.items(), key=lambda x: x[1], reverse=True)[:7]:
+            lines.append(f"• {fmt_day(d, amt)}")
+        return "\n".join(lines)
+
+    # Full: full revenue-by-day + weekday totals
+    lines.append("")
+    lines.append("Revenue by Day (all):")
+    for d in sorted(daily_totals.keys()):
+        amt = daily_totals[d]
+        lines.append(f"• {fmt_day(d, amt)}")
+
+    # Weekday totals
+    weekday_totals: Dict[str, float] = {}
+    for o in orders:
+        wd = o["timestamp"].astimezone(TIMEZONE).strftime("%A")
+        weekday_totals[wd] = weekday_totals.get(wd, 0.0) + o["amount"]
+
+    lines.append("")
+    lines.append("Totals by Weekday:")
+    for wd in WEEKDAY_ORDER:
+        if wd in weekday_totals:
+            lines.append(f"{wd}: ${weekday_totals[wd]:.2f}")
+
+    return "\n".join(lines)
+
+
+def parse_detail_level(args: List[str]) -> str:
+    """
+    Look for 'compact' or 'full' in args; default 'medium'.
+    """
+    lowered = [a.lower() for a in args]
+    if "compact" in lowered:
+        return "compact"
+    if "full" in lowered:
+        return "full"
+    return "medium"
+
+
+# ============= COMMAND HANDLERS =============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -428,15 +609,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Core commands:\n"
         "/totals – detailed list for current week/manual period grouped by weekday\n"
         "/week – same as /totals\n"
-        "/today – today’s orders only\n"
-        "/yesterday – yesterday’s orders only\n"
-        "/revenue – daily totals for the current week/manual period\n"
-        "/stats – summary stats for the current week/manual period\n"
-        "/orders – full detailed log for the current week/manual period\n"
+        "/today – today’s orders\n"
+        "/yesterday – yesterday’s orders\n"
+        "/revenue – daily totals for current period\n"
+        "/stats – summary stats for current period\n"
+        "/orders – alias for /totals\n"
         "/startweek – start a manual payout week (overrides auto calendar week)\n"
         "/endweek – end the current manual week and show totals\n"
-        "/clear – clear all stored data for this chat\n"
-        "/help – show this message again\n\n"
+        "/clear – clear all stored data for this chat\n\n"
+        "Advanced stats (include optional 'compact' or 'full'):\n"
+        "/last7days, /last14days, /last30days, /last60days, /last90days,\n"
+        "/last180days, /last365days, /alltime\n"
+        "Example: /last30days full\n\n"
+        "Custom range:\n"
+        "/statsrange YYYY-MM-DD YYYY-MM-DD [compact|full]\n"
+        "Example: /statsrange 2024-11-01 2024-11-15 compact\n\n"
         "Note: totals are stored in Supabase, so they survive restarts. "
         "Each Telegram chat (driver group) is tracked separately."
     )
@@ -476,15 +663,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         week_start_utc = last_monday_start(now_utc)
 
-    weekday = msg_time.astimezone(TIMEZONE).strftime("%A")
-
     for o in orders:
         save_order_to_supabase(
             chat_id=chat_id,
             msg_time=msg_time,
             location=o["location"],
             amount=o["amount"],
-            weekday=weekday,
             week_start_utc=week_start_utc,
         )
 
@@ -505,8 +689,8 @@ async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state = get_chat_state(chat_id)
 
     start, end, label = get_week_period(chat_state)
-    orders = fetch_orders_from_supabase(chat_id, start, end + timedelta(seconds=1))
-    text = format_orders_grouped_by_weekday(orders, label)
+    orders = fetch_orders_from_supabase(chat_id, start, end)
+    text = format_orders_grouped_by_weekday_per_order(orders, label)
     await message.reply_text(text)
 
 
@@ -526,7 +710,7 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start, end, day_name = get_today_bounds()
     orders = fetch_orders_from_supabase(chat_id, start, end)
     label = f"TODAY ({day_name})"
-    text = format_orders_grouped_by_weekday(orders, label)
+    text = format_orders_grouped_by_weekday_per_order(orders, label)
     await message.reply_text(text)
 
 
@@ -542,13 +726,13 @@ async def yesterday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start, end, day_name = get_yesterday_bounds()
     orders = fetch_orders_from_supabase(chat_id, start, end)
     label = f"YESTERDAY ({day_name})"
-    text = format_orders_grouped_by_weekday(orders, label)
+    text = format_orders_grouped_by_weekday_per_order(orders, label)
     await message.reply_text(text)
 
 
 async def revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /revenue – daily totals for the current hybrid week period.
+    /revenue – daily totals for the current hybrid week period (medium summary).
     """
     message = update.message
     if not message:
@@ -558,14 +742,14 @@ async def revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state = get_chat_state(chat_id)
 
     start, end, label = get_week_period(chat_state)
-    orders = fetch_orders_from_supabase(chat_id, start, end + timedelta(seconds=1))
-    text = format_revenue_by_day(orders, f"REVENUE BY DAY – {label}")
+    orders = fetch_orders_from_supabase(chat_id, start, end)
+    text = summarize_orders_range(orders, f"REVENUE – {label}", detail_level="medium")
     await message.reply_text(text)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /stats – summary stats for the current hybrid week period.
+    /stats – summary stats for the current hybrid week period (medium summary).
     """
     message = update.message
     if not message:
@@ -575,15 +759,14 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state = get_chat_state(chat_id)
 
     start, end, label = get_week_period(chat_state)
-    orders = fetch_orders_from_supabase(chat_id, start, end + timedelta(seconds=1))
-    stats_text = compute_stats(orders)
-    text = f"{label}\n\n{stats_text}"
+    orders = fetch_orders_from_supabase(chat_id, start, end)
+    text = summarize_orders_range(orders, label, detail_level="medium")
     await message.reply_text(text)
 
 
 async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /orders – alias for /totals (explicit full log for current period).
+    /orders – alias for /totals.
     """
     await totals_command(update, context)
 
@@ -597,30 +780,8 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = message.chat_id
-
-    if not SUPABASE_ORDERS_URL:
-        await message.reply_text("Supabase is not configured; nothing to clear.")
-        return
-
-    try:
-        # delete via REST: chat_id=eq.<chat_id>
-        params = [("chat_id", f"eq.{chat_id}")]
-        resp = requests.delete(
-            SUPABASE_ORDERS_URL,
-            headers=supabase_headers(),
-            params=params,
-            timeout=15,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"Error clearing orders for chat {chat_id}: {e}")
-
-    # reset in-memory manual state
-    CHAT_STATE[chat_id] = {
-        "manual_active": False,
-        "manual_start": None,
-    }
-
+    clear_orders_for_chat(chat_id)
+    CHAT_STATE[chat_id] = {"manual_active": False, "manual_start": None}
     await message.reply_text("All stored orders and week settings for this chat have been cleared.")
 
 
@@ -667,13 +828,117 @@ async def endweek_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start = chat_state["manual_start"]
     now_utc = datetime.now(tz=UTC)
 
-    orders = fetch_orders_from_supabase(chat_id, start, now_utc + timedelta(seconds=1))
-    text = format_orders_grouped_by_weekday(orders, "MANUAL WEEK FINAL TOTALS")
+    orders = fetch_orders_from_supabase(chat_id, start, now_utc)
+    text = format_orders_grouped_by_weekday_per_order(orders, "MANUAL WEEK FINAL TOTALS")
 
-    # reset manual mode
     chat_state["manual_active"] = False
     chat_state["manual_start"] = None
 
+    await message.reply_text(text)
+
+
+# ====== RANGE STATS COMMANDS (last7days, alltime, statsrange, etc.) ======
+
+async def handle_last_ndays(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    n_days: int,
+):
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    detail_level = parse_detail_level(context.args)
+    start, end = get_last_n_days_bounds(n_days)
+    orders = fetch_orders_from_supabase(chat_id, start, end)
+    label = f"LAST {n_days} DAYS (including today)"
+    text = summarize_orders_range(orders, label, detail_level)
+    await message.reply_text(text)
+
+
+async def last7days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_last_ndays(update, context, 7)
+
+
+async def last14days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_last_ndays(update, context, 14)
+
+
+async def last30days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_last_ndays(update, context, 30)
+
+
+async def last60days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_last_ndays(update, context, 60)
+
+
+async def last90days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_last_ndays(update, context, 90)
+
+
+async def last180days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_last_ndays(update, context, 180)
+
+
+async def last365days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await handle_last_ndays(update, context, 365)
+
+
+async def alltime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    detail_level = parse_detail_level(context.args)
+
+    orders = fetch_all_orders(chat_id)
+    label = "ALL-TIME TOTALS FOR THIS CHAT"
+    text = summarize_orders_range(orders, label, detail_level)
+    await message.reply_text(text)
+
+
+async def statsrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /statsrange YYYY-MM-DD YYYY-MM-DD [compact|full]
+    """
+    message = update.message
+    if not message:
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await message.reply_text(
+            "Usage: /statsrange YYYY-MM-DD YYYY-MM-DD [compact|full]"
+        )
+        return
+
+    date_str1 = args[0]
+    date_str2 = args[1]
+    detail_level = parse_detail_level(args[2:]) if len(args) > 2 else "medium"
+
+    try:
+        d1 = datetime.strptime(date_str1, "%Y-%m-%d").date()
+        d2 = datetime.strptime(date_str2, "%Y-%m-%d").date()
+    except ValueError:
+        await message.reply_text("Dates must be in YYYY-MM-DD format.")
+        return
+
+    if d2 < d1:
+        d1, d2 = d2, d1
+
+    start_local = datetime(d1.year, d1.month, d1.day, 0, 0, 0, tzinfo=TIMEZONE)
+    # end inclusive: end of d2 (23:59:59)
+    end_local = datetime(d2.year, d2.month, d2.day, 23, 59, 59, tzinfo=TIMEZONE)
+
+    start_utc = start_local.astimezone(UTC)
+    end_utc = end_local.astimezone(UTC)
+
+    chat_id = message.chat_id
+    orders = fetch_orders_from_supabase(chat_id, start_utc, end_utc)
+    label = f"CUSTOM STATS ({d1.isoformat()} → {d2.isoformat()})"
+    text = summarize_orders_range(orders, label, detail_level)
     await message.reply_text(text)
 
 
@@ -693,6 +958,7 @@ def main():
         .build()
     )
 
+    # Core commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("totals", totals_command))
@@ -706,6 +972,18 @@ def main():
     application.add_handler(CommandHandler("startweek", startweek_command))
     application.add_handler(CommandHandler("endweek", endweek_command))
 
+    # Range/stat commands
+    application.add_handler(CommandHandler("last7days", last7days_command))
+    application.add_handler(CommandHandler("last14days", last14days_command))
+    application.add_handler(CommandHandler("last30days", last30days_command))
+    application.add_handler(CommandHandler("last60days", last60days_command))
+    application.add_handler(CommandHandler("last90days", last90days_command))
+    application.add_handler(CommandHandler("last180days", last180days_command))
+    application.add_handler(CommandHandler("last365days", last365days_command))
+    application.add_handler(CommandHandler("alltime", alltime_command))
+    application.add_handler(CommandHandler("statsrange", statsrange_command))
+
+    # Message handler for orders
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
