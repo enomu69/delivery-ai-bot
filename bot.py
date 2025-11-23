@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -24,11 +24,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
-# timezone for reporting (your business timezone)
 TIMEZONE = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_MODEL = "gpt-4o-mini"  # full NLP
+
 
 # logging
 logging.basicConfig(
@@ -37,9 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Per-chat config (in memory only; resets on restart)
+# Per-chat config (default summary mode etc) - in-memory only
 CHAT_CONFIG: Dict[int, Dict[str, Any]] = {}
-DEFAULT_SUMMARY_MODE = "full"  # full | medium | compact
+DEFAULT_SUMMARY_MODE = "full"  # or "medium" / "compact"
 
 
 def get_chat_config(chat_id: int) -> Dict[str, Any]:
@@ -57,6 +58,7 @@ def supabase_headers() -> Dict[str, str]:
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
 
@@ -75,15 +77,15 @@ def supabase_insert_orders(
 
     url = f"{SUPABASE_URL}/rest/v1/orders"
 
-    rows = []
     # start of calendar week (Monday 00:00) in UTC
-    week_start_local = msg_time_utc.astimezone(TIMEZONE)
-    days_since_monday = week_start_local.weekday()
-    monday_local = (week_start_local - timedelta(days=days_since_monday)).replace(
+    local = msg_time_utc.astimezone(TIMEZONE)
+    days_since_monday = local.weekday()
+    monday_local = (local - timedelta(days=days_since_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    week_start_utc = monday_local.astimezone(ZoneInfo("UTC"))
+    week_start_utc = monday_local.astimezone(UTC)
 
+    rows = []
     for o in orders:
         rows.append(
             {
@@ -105,11 +107,11 @@ def supabase_insert_orders(
             params=params,
             headers=headers,
             data=json.dumps(rows),
-            timeout=15,
+            timeout=20,
         )
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"Inserted {len(data)} orders to Supabase for chat {chat_id}")
+        logger.info(f"Inserted {len(data)} orders into Supabase for chat {chat_id}")
     except Exception as e:
         logger.error(f"Supabase insert error: {e}")
 
@@ -154,7 +156,7 @@ def supabase_fetch_orders(
             url,
             headers=supabase_headers(),
             params=params,
-            timeout=15,
+            timeout=20,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -164,7 +166,10 @@ def supabase_fetch_orders(
         return []
 
 
-def supabase_fetch_pending(chat_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+def supabase_fetch_pending(chat_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetch latest pending orders (most recent first).
+    """
     return supabase_fetch_orders(
         chat_id=chat_id,
         status="pending",
@@ -176,6 +181,9 @@ def supabase_fetch_pending(chat_id: int, limit: int = 5) -> List[Dict[str, Any]]
 
 
 def supabase_update_status(order_ids: List[int], new_status: str):
+    """
+    Update status for the given order IDs.
+    """
     if not order_ids:
         return
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -197,7 +205,7 @@ def supabase_update_status(order_ids: List[int], new_status: str):
                 params=params,
                 headers=headers,
                 data=json.dumps({"status": new_status}),
-                timeout=15,
+                timeout=20,
             )
             resp.raise_for_status()
             logger.info(f"Updated order {oid} to status={new_status}")
@@ -205,259 +213,189 @@ def supabase_update_status(order_ids: List[int], new_status: str):
             logger.error(f"Supabase status update error for id={oid}: {e}")
 
 
-# ============= OPENAI ORDER EXTRACTION =============
+# ============= OPENAI FULL NLP ANALYZER =============
 
-def call_openai_chat(prompt: str) -> Optional[str]:
+def call_openai_analyzer(
+    message_text: str,
+    pending_orders: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Ask OpenAI to decide:
+    - is this message accepting/rejecting existing orders?
+    - or creating new orders?
+    - or irrelevant?
+
+    Returns a dict:
+    {
+      "action": "confirm" | "reject" | "orders" | "ignore",
+      "accepted_indices": [1,2],
+      "rejected_indices": [3],
+      "new_orders": [{"location": "...", "amount": 35.0}]
+    }
+    where indices refer to the numbered pending_orders context we provide.
+    """
     if not OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY is not set.")
+        logger.error("OPENAI_API_KEY not set.")
         return None
+
+    # Build pending orders context (indexed)
+    if pending_orders:
+        lines = []
+        for idx, o in enumerate(pending_orders, start=1):
+            loc = o.get("location", "")
+            amt = float(o.get("amount", 0) or 0)
+            ts_str = o.get("order_timestamp") or ""
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts_local = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                ts_local = ts_str
+            lines.append(f"{idx}) {loc}, ${amt:.2f}, time={ts_local}")
+        pending_text = "\n".join(lines)
+    else:
+        pending_text = "(none)"
+
+    system_prompt = """
+You are an assistant for a weed delivery dispatch system.
+
+There is ONE driver per chat. The dispatcher posts offers as "pending orders".
+The driver later sends messages which may ACCEPT or REJECT some of those pending orders.
+Sometimes, the dispatcher is also sending NEW orders in the same chat.
+
+You are given:
+- A list of CURRENT PENDING ORDERS, each with an index starting at 1.
+- A NEW chat message from this driver/dispatcher.
+
+Your job:
+1) Decide what the message is doing:
+   - ACCEPTING one or more pending orders
+   - REJECTING one or more pending orders
+   - DESCRIBING NEW orders (for this driver)
+   - Or IRRELEVANT (small talk, questions, etc.)
+
+2) If the message accepts orders:
+   - Use "action": "confirm".
+   - Put the indices of accepted pending orders in "accepted_indices".
+   - If the message clearly accepts ALL pending orders ("I'll take both", "I'll take everything", "I'll take them", "send it", etc.), put ALL indices.
+   - Treat positive emojis like 👍 ❤️ 🙌 ✔️ ✅ 💯 as accepting the relevant pending orders.
+
+3) If the message rejects orders:
+   - Use "action": "reject" (or also use 'confirm' if it both accepts and rejects different ones).
+   - Put indices of rejected pending orders in "rejected_indices".
+   - Treat negative emojis like 👎 ❌ 🚫 ⛔ as rejecting the relevant pending orders.
+
+4) If the message describes NEW orders:
+   - Use "action": "orders".
+   - Extract each order into an object {"location": string, "amount": float}.
+   - Ignore time windows, emojis, or extra commentary.
+   - If no valid orders are described, leave "new_orders" as an empty list.
+
+5) If the message does not clearly refer to any pending orders and does not clearly describe new orders:
+   - Use "action": "ignore".
+   - Keep all lists empty.
+
+IMPORTANT:
+- "accepted_indices" and "rejected_indices" must reference the numbered pending orders (1,2,3,...).
+- The message may both accept and reject different orders at once (e.g., accept index 1, reject index 2).
+- Always include ALL keys: "action", "accepted_indices", "rejected_indices", "new_orders" in the JSON.
+
+Return ONLY JSON, no explanations.
+"""
+
+    user_prompt = f"""
+CURRENT PENDING ORDERS (for this driver/chat):
+{pending_text}
+
+NEW MESSAGE:
+\"\"\"{message_text}\"\"\"
+
+Now output JSON like:
+{{
+  "action": "confirm" | "reject" | "orders" | "ignore",
+  "accepted_indices": [1,2],
+  "rejected_indices": [3],
+  "new_orders": [
+    {{"location": "Example", "amount": 35.0}}
+  ]
+}}
+"""
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You extract structured delivery orders (location + amount) "
-                    "and respond ONLY with JSON."
-                ),
-            },
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
     }
 
     try:
-        resp = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=15)
+        resp = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=25)
         resp.raise_for_status()
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return content
+        content = data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error(f"Error calling OpenAI HTTP API: {e}")
+        logger.error(f"OpenAI analyzer error: {e}")
         return None
 
-
-async def extract_orders_from_text(text: str) -> List[Dict[str, Any]]:
-    """
-    Use OpenAI to extract zero or more orders from a dispatcher message.
-    """
-    # quick cheap heuristic: if no digit, probably no amount -> skip OpenAI
-    if not any(ch.isdigit() for ch in text):
-        return []
-
-    prompt = f"""
-You are a precise data extraction assistant for a weed delivery dispatch team.
-
-A dispatcher posts messy natural-language messages describing one or more delivery orders.
-Each order has:
-- a LOCATION (like "Manassas", "Alexandria", "Upper Marlboro", "Deale MD", "DC", etc.)
-- an AMOUNT in dollars (e.g. $35 means 35.0)
-
-Your job:
-- Read the message carefully.
-- Find ALL delivery orders mentioned.
-- For each, return an object with "location" and "amount".
-- Ignore time windows, emojis, extra commentary, and anything not clearly an order.
-- If a location is mentioned with no clear dollar amount, skip that location.
-- If the message does NOT contain any valid orders, return an empty list.
-
-Output STRICTLY valid JSON in this EXACT format (no extra text, no comments):
-
-[
-  {{"location": "ExampleLocation", "amount": 35.0}}
-]
-
-Now extract orders from this message:
-
-\"\"\"{text}\"\"\"
-"""
-
-    content = call_openai_chat(prompt)
-    if content is None:
-        return []
-
-    content = content.strip()
+    # Strip code fences if present
     if content.startswith("```"):
         content = content.strip("`")
         if "\n" in content:
             content = content.split("\n", 1)[1].strip()
 
     try:
-        data = json.loads(content)
+        parsed = json.loads(content)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error from OpenAI response: {e} | content={content[:200]}")
-        return []
-
-    orders: List[Dict[str, Any]] = []
-    if isinstance(data, list):
-        for item in data:
-            try:
-                loc = str(item.get("location", "")).strip()
-                amt = float(item.get("amount", 0))
-                if loc and amt > 0:
-                    orders.append({"location": loc, "amount": amt})
-            except Exception:
-                continue
-    return orders
-
-
-# ============= INTENT + CONFIRMATION / REJECTION =============
-
-ACCEPT_EMOJIS = {"👍", "❤️", "♥️", "🙏", "🙌", "🔥", "✔️", "✅", "😎", "👌", "💯", "😁", "🙂", "🤝", "🚀"}
-REJECT_EMOJIS = {"👎", "❌", "🚫", "⛔", "😕", "😒", "🤦"}
-
-
-ACCEPT_PHRASES = [
-    "send it",
-    "send them",
-    "send",
-    "coming",
-    "on the way",
-    "otw",
-    "omw",
-    "headed there",
-    "be there soon",
-    "i'll take",
-    "ill take",
-    "i will take",
-    "i can take",
-    "i can do",
-    "i'll do",
-    "ill do",
-    "run it",
-    "lock me in",
-    "got it",
-    "got them",
-    "i got it",
-    "i got them",
-    "i'll grab",
-    "ill grab",
-    "i'll scoop",
-    "ill scoop",
-    "i'll go",
-    "ill go",
-    "i'll pick it up",
-    "ill pick it up",
-    "i'm down",
-    "im down",
-    "sure",
-    "ok",
-    "okay",
-    "bet",
-    "say less",
-    "i'll take both",
-    "ill take both",
-    "i'll take them",
-    "ill take them",
-    "i'll take it",
-    "ill take it",
-    "i'll do it",
-    "ill do it",
-]
-
-REJECT_PHRASES = [
-    "can't",
-    "cant",
-    "cannot",
-    "won't",
-    "wont",
-    "no ",
-    " no",
-    "nah",
-    "not taking",
-    "don't want",
-    "dont want",
-    "skip it",
-    "skip that",
-    "pass",
-    "reject",
-    "drop it",
-    "can't do",
-    "cant do",
-    "can't take",
-    "cant take",
-]
-
-
-def classify_intent(text: str) -> Optional[str]:
-    """
-    Return 'accept', 'reject', or None.
-    """
-    t = text.strip()
-    if not t:
+        logger.error(f"Analyzer JSON parse error: {e} | content={content[:200]}")
         return None
 
-    # emoji-only messages
-    if len(t) <= 4 and all(ch in ACCEPT_EMOJIS or ch in REJECT_EMOJIS for ch in t):
-        if any(ch in REJECT_EMOJIS for ch in t):
-            return "reject"
-        if any(ch in ACCEPT_EMOJIS for ch in t):
-            return "accept"
+    action = parsed.get("action", "ignore")
+    accepted_indices = parsed.get("accepted_indices", []) or []
+    rejected_indices = parsed.get("rejected_indices", []) or []
+    new_orders = parsed.get("new_orders", []) or []
 
-    lower = t.lower()
+    def to_int_list(x):
+        res = []
+        for v in x:
+            try:
+                iv = int(v)
+                res.append(iv)
+            except Exception:
+                continue
+        return res
 
-    # check rejection first (so "can't take it" doesn't get treated as accept)
-    for phrase in REJECT_PHRASES:
-        if phrase in lower:
-            return "reject"
+    accepted_indices = to_int_list(accepted_indices)
+    rejected_indices = to_int_list(rejected_indices)
 
-    for phrase in ACCEPT_PHRASES:
-        if phrase in lower:
-            return "accept"
+    cleaned_new_orders: List[Dict[str, Any]] = []
+    for item in new_orders:
+        try:
+            loc = str(item.get("location", "")).strip()
+            amt = float(item.get("amount", 0))
+            if loc and amt > 0:
+                cleaned_new_orders.append({"location": loc, "amount": amt})
+        except Exception:
+            continue
 
-    return None
-
-
-def match_orders_for_message(
-    message_text: str,
-    pending_orders: List[Dict[str, Any]],
-) -> List[int]:
-    """
-    Decide which pending orders a confirmation/rejection applies to.
-    Strategy:
-      - if only one pending -> that one
-      - else, if message mentions a location name -> those that match
-      - else, if message says "both"/"all" -> all
-      - else -> most recent only
-    """
-    if not pending_orders:
-        return []
-
-    if len(pending_orders) == 1:
-        return [pending_orders[0]["id"]]
-
-    txt = message_text.lower()
-
-    # try location-based matching
-    matched_ids: List[int] = []
-    for o in pending_orders:
-        loc = str(o.get("location", "")).lower()
-        if loc and loc in txt:
-            matched_ids.append(o["id"])
-
-    if matched_ids:
-        return matched_ids
-
-    # phrases for multiple
-    if "both" in txt or "all" in txt or "2 orders" in txt or "two orders" in txt:
-        return [o["id"] for o in pending_orders]
-
-    # default: most recent pending (first in list because we sorted desc)
-    return [pending_orders[0]["id"]]
+    return {
+        "action": str(action),
+        "accepted_indices": accepted_indices,
+        "rejected_indices": rejected_indices,
+        "new_orders": cleaned_new_orders,
+    }
 
 
-# ============= COMMAND HELPERS =============
+# ============= DATE / SUMMARY HELPERS =============
 
 def start_of_today_utc() -> datetime:
     now_local = datetime.now(tz=TIMEZONE)
     today_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return today_local.astimezone(ZoneInfo("UTC"))
+    return today_local.astimezone(UTC)
 
 
 def start_of_week_utc() -> datetime:
@@ -466,11 +404,11 @@ def start_of_week_utc() -> datetime:
     monday_local = (now_local - timedelta(days=days_since_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    return monday_local.astimezone(ZoneInfo("UTC"))
+    return monday_local.astimezone(UTC)
 
 
 def days_ago_utc(days: int) -> datetime:
-    now_utc = datetime.now(tz=ZoneInfo("UTC"))
+    now_utc = datetime.now(tz=UTC)
     return now_utc - timedelta(days=days)
 
 
@@ -479,22 +417,32 @@ def summarize_orders(
     label: str,
     summary_mode: str = "full",
 ) -> str:
+    """
+    Build a human-readable summary.
+    - full: per-day totals + each order
+    - medium: per-day totals only
+    - compact: just overall stats
+    """
     if not orders:
         return f"{label}\n\nNo accepted orders in this period."
 
-    # convert timestamps to local & group by date
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     total_amount = 0.0
 
     for o in orders:
-        ts = datetime.fromisoformat(o["order_timestamp"].replace("Z", "+00:00"))
-        local_date = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d (%a)")
+        ts_str = o.get("order_timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            local_date = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d (%a)")
+        except Exception:
+            local_date = "Unknown date"
         grouped.setdefault(local_date, []).append(o)
         total_amount += float(o["amount"])
 
     lines: List[str] = [label, ""]
     num_days = len(grouped)
 
+    # day-level
     for date_key in sorted(grouped.keys()):
         day_orders = grouped[date_key]
         day_total = sum(float(o["amount"]) for o in day_orders)
@@ -503,45 +451,74 @@ def summarize_orders(
             lines.append(f"{date_key}: ${day_total:.2f}")
 
         if summary_mode == "full":
-            # show individual orders in time order
-            for o in sorted(
-                day_orders,
-                key=lambda x: x["order_timestamp"],
-            ):
+            for o in sorted(day_orders, key=lambda x: x["order_timestamp"]):
                 lines.append(f"  - {o['location']}: ${float(o['amount']):.2f}")
             lines.append("")
 
     if summary_mode == "compact":
         lines = [label, ""]
 
+    # overall stats
     lines.append(f"TOTAL: ${total_amount:.2f}")
     avg_per_day = total_amount / num_days if num_days > 0 else 0.0
     lines.append(f"Avg per active day: ${avg_per_day:.2f}")
 
+    # simple location breakdown
+    per_location: Dict[str, float] = {}
+    for o in orders:
+        loc = str(o.get("location", "Unknown"))
+        amt = float(o.get("amount", 0))
+        per_location[loc] = per_location.get(loc, 0.0) + amt
+
+    if summary_mode in ("full", "medium"):
+        lines.append("")
+        lines.append("By location:")
+        for loc, amt in sorted(per_location.items(), key=lambda x: -x[1]):
+            lines.append(f"- {loc}: ${amt:.2f}")
+
     return "\n".join(lines)
 
 
-# ============= HANDLERS =============
+def get_mode_from_args(chat_id: int, args: List[str]) -> str:
+    """
+    If args[0] is "full|medium|compact", use that.
+    Otherwise use this chat's stored default mode.
+    """
+    cfg = get_chat_config(chat_id)
+    if args:
+        candidate = args[0].lower()
+        if candidate in ("full", "medium", "compact"):
+            return candidate
+    return cfg["summary_mode"]
+
+
+# ============= COMMAND HANDLERS =============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Hey! I'm your delivery totals bot.\n\n"
-        "How it works:\n"
-        "• Dispatcher posts messages with orders (locations + $ amounts).\n"
-        "• I extract those orders and save them as *pending*.\n"
-        "• When the driver confirms (text like 'send it', 'coming', 'I'll take it' or emoji like 👍❤️✔️), "
-        "I mark those orders as *accepted*.\n"
-        "• Rejections like 'can't', 'nah', or 👎 mark them as *rejected*.\n"
-        "• Only *accepted* orders count toward totals & stats.\n\n"
+        "How I work (NLP mode):\n"
+        "• Dispatcher posts offers in the chat (locations + $ amounts) → I save them as *pending* orders.\n"
+        "• When the driver confirms (\"send it\", \"coming\", \"I'll take it\", 👍, etc.), "
+        "I mark those pending orders as *accepted*.\n"
+        "• When the driver rejects (\"can't\", \"nah\", 👎, etc.), I mark them as *rejected*.\n"
+        "• Only *accepted* orders count toward your totals & stats.\n\n"
         "Commands:\n"
         "/today – accepted orders today\n"
-        "/totals – this calendar week (since Monday)\n"
-        "/last7days – last 7 days\n"
+        "/totals – accepted orders this calendar week (since Monday)\n"
+        "/last7days – accepted orders in last 7 days\n"
+        "/last14days – last 14 days\n"
         "/last30days – last 30 days\n"
+        "/last60days – last 60 days\n"
+        "/last90days – last 90 days\n"
+        "/last180days – last 180 days\n"
+        "/last365days – last 365 days\n"
         "/alltime – all accepted orders ever\n"
+        "/statsrange YYYY-MM-DD YYYY-MM-DD [full|medium|compact] – custom date range\n"
         "/pending – show recent pending orders\n"
-        "/mode full|medium|compact – change summary detail\n"
-        "/help – show this again"
+        "/mode full|medium|compact – set how detailed summaries are\n"
+        "/help – show this again\n\n"
+        "Tip: you can also do /last30days compact or /totals full to override the mode just for that command."
     )
     if update.message:
         await update.message.reply_text(msg)
@@ -558,8 +535,9 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = message.chat_id
     args = context.args
+    cfg = get_chat_config(chat_id)
+
     if not args:
-        cfg = get_chat_config(chat_id)
         await message.reply_text(
             f"Current summary mode: {cfg['summary_mode']}\n"
             "Options: full, medium, compact\n"
@@ -572,16 +550,18 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Invalid mode. Use one of: full, medium, compact.")
         return
 
-    cfg = get_chat_config(chat_id)
     cfg["summary_mode"] = choice
     await message.reply_text(f"Summary mode set to: {choice}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handle any non-command text message.
-    1) Try to interpret as confirmation/rejection for pending orders.
-    2) If not, try to extract new orders from dispatcher text.
+    Main message handler:
+    - Always calls OpenAI analyzer with current pending orders.
+    - Analyzer decides:
+      • action: confirm / reject / orders / ignore
+      • which pending indices accepted/rejected
+      • any new orders in this message
     """
     message = update.message
     if not message or not message.text:
@@ -590,46 +570,83 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = message.chat_id
     text = message.text
 
-    # 1) intent classification
-    intent = classify_intent(text)
-    if intent in ("accept", "reject"):
-        pending = supabase_fetch_pending(chat_id, limit=5)
-        if not pending:
-            # nothing to apply this to
-            return
-
-        order_ids = match_orders_for_message(text, pending)
-        if not order_ids:
-            return
-
-        new_status = "accepted" if intent == "accept" else "rejected"
-        supabase_update_status(order_ids, new_status)
-
-        # small confirmation message
-        affected = [o for o in pending if o["id"] in order_ids]
-        parts = [f"{a['location']} ${float(a['amount']):.2f}" for a in affected]
-        joined = ", ".join(parts)
-        await message.reply_text(
-            f"Marked as *{new_status}*: {joined}", parse_mode="Markdown"
-        )
-        return
-
-    # 2) Maybe it's a dispatcher message with new orders
     msg_time = message.date
     if msg_time.tzinfo is None:
-        msg_time = msg_time.replace(tzinfo=ZoneInfo("UTC"))
-    msg_time_utc = msg_time.astimezone(ZoneInfo("UTC"))
+        msg_time = msg_time.replace(tzinfo=UTC)
+    msg_time_utc = msg_time.astimezone(UTC)
 
-    orders = await extract_orders_from_text(text)
-    if not orders:
+    # Fetch recent pending orders for this chat (most recent first)
+    pending = supabase_fetch_pending(chat_id, limit=10)
+
+    analysis = call_openai_analyzer(text, pending)
+    if analysis is None:
         return
 
-    # Insert as pending
-    supabase_insert_orders(chat_id, orders, msg_time_utc)
-    lines = [f"Stored {len(orders)} pending order(s):"]
-    for o in orders:
-        lines.append(f"- {o['location']}: ${float(o['amount']):.2f}")
-    await message.reply_text("\n".join(lines))
+    action = analysis["action"]
+    accepted_indices = analysis["accepted_indices"]
+    rejected_indices = analysis["rejected_indices"]
+    new_orders = analysis["new_orders"]
+
+    # Map indices -> Supabase IDs using 'pending' list
+    def indices_to_ids(indices: List[int]) -> List[int]:
+        ids: List[int] = []
+        for idx in indices:
+            if 1 <= idx <= len(pending):
+                oid = pending[idx - 1].get("id")
+                if oid is not None:
+                    try:
+                        ids.append(int(oid))
+                    except Exception:
+                        continue
+        return ids
+
+    accepted_ids = indices_to_ids(accepted_indices)
+    rejected_ids = indices_to_ids(rejected_indices)
+
+    # Insert newly described orders as pending
+    if new_orders:
+        supabase_insert_orders(chat_id, new_orders, msg_time_utc)
+
+    # Update statuses based on acceptance/rejection
+    if accepted_ids:
+        supabase_update_status(accepted_ids, "accepted")
+    if rejected_ids:
+        supabase_update_status(rejected_ids, "rejected")
+
+    # Build feedback message
+    parts = []
+
+    if new_orders:
+        lines = [f"Stored {len(new_orders)} pending order(s):"]
+        for o in new_orders:
+            lines.append(f"- {o['location']}: ${float(o['amount']):.2f}")
+        parts.append("\n".join(lines))
+
+    if accepted_ids:
+        accepted_details = [
+            o for o in pending if int(o.get("id", -1)) in accepted_ids
+        ]
+        if accepted_details:
+            lines = ["Marked as *accepted*:"]
+            for o in accepted_details:
+                lines.append(f"- {o['location']} ${float(o['amount']):.2f}")
+            parts.append("\n".join(lines))
+
+    if rejected_ids:
+        rejected_details = [
+            o for o in pending if int(o.get("id", -1)) in rejected_ids
+        ]
+        if rejected_details:
+            lines = ["Marked as *rejected*:"]
+            for o in rejected_details:
+                lines.append(f"- {o['location']} ${float(o['amount']):.2f}")
+            parts.append("\n".join(lines))
+
+    if not parts:
+        # analyzer decided ignore / nothing to do
+        return
+
+    await message.reply_text("\n\n".join(parts), parse_mode="Markdown")
 
 
 async def generic_range_command(
@@ -638,16 +655,18 @@ async def generic_range_command(
     label: str,
     start_utc: datetime,
     end_utc: Optional[datetime] = None,
+    summary_mode: Optional[str] = None,
 ):
     message = update.message
     if not message:
         return
 
     chat_id = message.chat_id
-    cfg = get_chat_config(chat_id)
-
     if end_utc is None:
-        end_utc = datetime.now(tz=ZoneInfo("UTC"))
+        end_utc = datetime.now(tz=UTC)
+
+    if summary_mode is None:
+        summary_mode = get_chat_config(chat_id)["summary_mode"]
 
     orders = supabase_fetch_orders(
         chat_id=chat_id,
@@ -658,48 +677,230 @@ async def generic_range_command(
         order_desc=False,
     )
 
-    text = summarize_orders(orders, label, summary_mode=cfg["summary_mode"])
+    text = summarize_orders(orders, label, summary_mode=summary_mode)
     await message.reply_text(text)
 
 
+# ---- Range commands ----
+
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
     start = start_of_today_utc()
-    await generic_range_command(update, context, "TODAY (accepted orders)", start)
+    await generic_range_command(
+        update,
+        context,
+        "TODAY (accepted orders)",
+        start,
+        summary_mode=mode,
+    )
 
 
 async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
     start = start_of_week_utc()
     await generic_range_command(
-        update, context, "THIS WEEK (since Monday, accepted orders)", start
+        update,
+        context,
+        "THIS WEEK (accepted orders since Monday)",
+        start,
+        summary_mode=mode,
     )
 
 
-async def last7_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def last7days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
     start = days_ago_utc(7)
     await generic_range_command(
-        update, context, "LAST 7 DAYS (accepted orders)", start
+        update,
+        context,
+        "LAST 7 DAYS (accepted orders)",
+        start,
+        summary_mode=mode,
     )
 
 
-async def last30_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def last14days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
+    start = days_ago_utc(14)
+    await generic_range_command(
+        update,
+        context,
+        "LAST 14 DAYS (accepted orders)",
+        start,
+        summary_mode=mode,
+    )
+
+
+async def last30days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
     start = days_ago_utc(30)
     await generic_range_command(
-        update, context, "LAST 30 DAYS (accepted orders)", start
+        update,
+        context,
+        "LAST 30 DAYS (accepted orders)",
+        start,
+        summary_mode=mode,
+    )
+
+
+async def last60days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
+    start = days_ago_utc(60)
+    await generic_range_command(
+        update,
+        context,
+        "LAST 60 DAYS (accepted orders)",
+        start,
+        summary_mode=mode,
+    )
+
+
+async def last90days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
+    start = days_ago_utc(90)
+    await generic_range_command(
+        update,
+        context,
+        "LAST 90 DAYS (accepted orders)",
+        start,
+        summary_mode=mode,
+    )
+
+
+async def last180days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
+    start = days_ago_utc(180)
+    await generic_range_command(
+        update,
+        context,
+        "LAST 180 DAYS (accepted orders)",
+        start,
+        summary_mode=mode,
+    )
+
+
+async def last365days_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
+    start = days_ago_utc(365)
+    await generic_range_command(
+        update,
+        context,
+        "LAST 365 DAYS (accepted orders)",
+        start,
+        summary_mode=mode,
     )
 
 
 async def alltime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # effectively from far past
-    start = datetime(2000, 1, 1, tzinfo=ZoneInfo("UTC"))
-    await generic_range_command(update, context, "ALL-TIME (accepted orders)", start)
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    mode = get_mode_from_args(chat_id, context.args)
+    start = datetime(2000, 1, 1, tzinfo=UTC)
+    await generic_range_command(
+        update,
+        context,
+        "ALL-TIME (accepted orders)",
+        start,
+        summary_mode=mode,
+    )
+
+
+async def statsrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /statsrange YYYY-MM-DD YYYY-MM-DD [full|medium|compact]
+    """
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    args = context.args
+
+    if len(args) < 2:
+        await message.reply_text(
+            "Usage: /statsrange YYYY-MM-DD YYYY-MM-DD [full|medium|compact]\n"
+            "Example: /statsrange 2025-01-01 2025-01-15 full"
+        )
+        return
+
+    start_str, end_str = args[0], args[1]
+    mode = get_chat_config(chat_id)["summary_mode"]
+    if len(args) >= 3:
+        maybe_mode = args[2].lower()
+        if maybe_mode in ("full", "medium", "compact"):
+            mode = maybe_mode
+
+    try:
+        start_date = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=UTC)
+        end_date = datetime.strptime(end_str, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError:
+        await message.reply_text(
+            "Dates must be in YYYY-MM-DD format, e.g.\n"
+            "/statsrange 2025-01-01 2025-01-15"
+        )
+        return
+
+    if end_date < start_date:
+        await message.reply_text("End date must be on or after start date.")
+        return
+
+    # end is exclusive -> add 1 day
+    end_utc = end_date + timedelta(days=1)
+    label = f"STATS {start_str} to {end_str} (accepted orders)"
+    await generic_range_command(
+        update,
+        context,
+        label,
+        start_date,
+        end_utc,
+        summary_mode=mode,
+    )
 
 
 async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
-    chat_id = message.chat_id
 
+    chat_id = message.chat_id
     pending = supabase_fetch_pending(chat_id, limit=10)
     if not pending:
         await message.reply_text("No pending orders for this chat.")
@@ -707,8 +908,12 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["Recent pending orders:"]
     for o in pending:
-        ts = datetime.fromisoformat(o["order_timestamp"].replace("Z", "+00:00"))
-        local_ts = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+        ts_str = o.get("order_timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            local_ts = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            local_ts = ts_str
         lines.append(
             f"- #{o['id']} {o['location']} ${float(o['amount']):.2f} ({local_ts})"
         )
@@ -735,9 +940,15 @@ def main():
 
     application.add_handler(CommandHandler("today", today_command))
     application.add_handler(CommandHandler("totals", totals_command))
-    application.add_handler(CommandHandler("last7days", last7_command))
-    application.add_handler(CommandHandler("last30days", last30_command))
+    application.add_handler(CommandHandler("last7days", last7days_command))
+    application.add_handler(CommandHandler("last14days", last14days_command))
+    application.add_handler(CommandHandler("last30days", last30days_command))
+    application.add_handler(CommandHandler("last60days", last60days_command))
+    application.add_handler(CommandHandler("last90days", last90days_command))
+    application.add_handler(CommandHandler("last180days", last180days_command))
+    application.add_handler(CommandHandler("last365days", last365days_command))
     application.add_handler(CommandHandler("alltime", alltime_command))
+    application.add_handler(CommandHandler("statsrange", statsrange_command))
     application.add_handler(CommandHandler("pending", pending_command))
 
     # messages (non-commands)
