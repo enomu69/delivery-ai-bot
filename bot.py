@@ -415,18 +415,116 @@ def summarize_orders(
     return "\n".join(lines)
 
 
+def summarize_revenue_by_day(
+    orders: List[Dict[str, Any]],
+    label: str,
+) -> str:
+    """
+    /revenue: show daily totals for the current period (calendar week).
+    """
+    if not orders:
+        return f"{label}\n\nNo accepted orders in this period."
+
+    grouped: Dict[str, float] = {}
+    for o in orders:
+        ts_str = o.get("order_timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            local_date = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d (%a)")
+        except:
+            local_date = "Unknown date"
+        grouped[local_date] = grouped.get(local_date, 0.0) + float(o["amount"])
+
+    lines = [label, ""]
+    total_amount = 0.0
+
+    for date_key in sorted(grouped.keys()):
+        day_total = grouped[date_key]
+        total_amount += day_total
+        lines.append(f"{date_key}: ${day_total:.2f}")
+
+    lines.append("")
+    lines.append(f"TOTAL: ${total_amount:.2f}")
+    avg_per_day = total_amount / len(grouped) if grouped else 0.0
+    lines.append(f"Avg per active day: ${avg_per_day:.2f}")
+
+    return "\n".join(lines)
+
+
+def summarize_stats_week(orders: List[Dict[str, Any]], label: str) -> str:
+    """
+    /stats: summary stats for current calendar week.
+    """
+    if not orders:
+        return f"{label}\n\nNo accepted orders in this period."
+
+    total_amount = 0.0
+    num_orders = len(orders)
+    grouped_days: Dict[str, float] = {}
+    for o in orders:
+        amt = float(o.get("amount", 0))
+        total_amount += amt
+
+        ts_str = o.get("order_timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            local_date = ts.astimezone(TIMEZONE).strftime("%Y-%m-%d (%a)")
+        except:
+            local_date = "Unknown date"
+
+        grouped_days[local_date] = grouped_days.get(local_date, 0.0) + amt
+
+    num_days = len(grouped_days) if grouped_days else 0
+    avg_per_order = total_amount / num_orders if num_orders else 0.0
+    avg_per_day = total_amount / num_days if num_days else 0.0
+
+    best_day = None
+    best_day_amount = 0.0
+    for d, amt in grouped_days.items():
+        if amt > best_day_amount:
+            best_day_amount = amt
+            best_day = d
+
+    lines = [label, ""]
+    lines.append(f"Total revenue: ${total_amount:.2f}")
+    lines.append(f"Total accepted orders: {num_orders}")
+    lines.append(f"Avg per order: ${avg_per_order:.2f}")
+    lines.append(f"Avg per active day: ${avg_per_day:.2f}")
+    if best_day:
+        lines.append(f"Best day: {best_day} (${best_day_amount:.2f})")
+
+    return "\n".join(lines)
+
+
 # ============= COMMAND HANDLERS =============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Hey! I'm your delivery totals bot.\n\n"
-        "How I work:\n"
-        "• Dispatcher posts offers → I save them as *pending*.\n"
-        "• Driver confirms (\"send it\", 👍, \"coming\", etc.) → I mark as *accepted*.\n"
-        "• Driver rejects (\"nah\", 👎, \"can't\", etc.) → I mark as *rejected*.\n\n"
-        "Commands:\n"
-        "/today\n/totals\n/last7days\n/last30days\n/alltime\n"
-        "/pending\n/statsrange\n/mode\n"
+        "I watch this chat for dispatch messages like:\n"
+        "• I have Manassas for $35 for 3-4 Alex\n"
+        "• I have largo $27 1-2 can go early and Alexandria $30 2-3\n"
+        "• Adding Woodbridge to route for $35\n\n"
+        "I automatically extract the *location* + *amount*, save them to Supabase,\n"
+        "and keep a running tally per chat. When drivers confirm (\"send it\", 👍, \"coming\"),\n"
+        "I mark those orders as accepted. Rejections (\"nah\", 👎, \"can't\") are tracked too.\n\n"
+        "Reporting commands (accepted orders only):\n"
+        "/today – today\n"
+        "/yesterday – yesterday\n"
+        "/totals – this calendar week\n"
+        "/week – alias for /totals\n"
+        "/orders – alias for /totals\n"
+        "/revenue – daily totals this week\n"
+        "/stats – summary stats this week\n\n"
+        "Advanced stats:\n"
+        "/last7days, /last14days, /last30days, /last60days, /last90days,\n"
+        "/last180days, /last365days, /alltime\n"
+        "Use optional mode: full / medium / compact\n\n"
+        "Custom range:\n"
+        "/statsrange YYYY-MM-DD YYYY-MM-DD [full|medium|compact]\n\n"
+        "Other:\n"
+        "/pending – show recent pending orders\n"
+        "/mode – change default summary mode\n"
     )
     if update.message:
         await update.message.reply_text(msg)
@@ -516,7 +614,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 
-# ============= RANGE COMMANDS =============
+# ============= RANGE + REPORTING COMMANDS =============
 
 async def generic_range_command(
     update: Update,
@@ -549,7 +647,7 @@ async def generic_range_command(
     await message.reply_text(text)
 
 
-# ---- Commands ----
+# ---- Base commands ----
 
 async def today_command(update, context):
     chat_id = update.message.chat_id
@@ -558,9 +656,46 @@ async def today_command(update, context):
 
 
 async def totals_command(update, context):
+    """
+    Calendar week totals (Monday → now).
+    """
     chat_id = update.message.chat_id
     mode = get_chat_config(chat_id)["summary_mode"]
     await generic_range_command(update, context, "THIS WEEK", start_of_week_utc(), summary_mode=mode)
+
+
+# Aliases
+
+async def week_command(update, context):
+    """
+    /week – alias for /totals (calendar week).
+    """
+    await totals_command(update, context)
+
+
+async def orders_command(update, context):
+    """
+    /orders – alias for /totals.
+    """
+    await totals_command(update, context)
+
+
+async def yesterday_command(update, context):
+    """
+    YESTERDAY = [start_of_today - 1 day, start_of_today)
+    """
+    chat_id = update.message.chat_id
+    mode = get_chat_config(chat_id)["summary_mode"]
+    today_start = start_of_today_utc()
+    yesterday_start = today_start - timedelta(days=1)
+    await generic_range_command(
+        update,
+        context,
+        "YESTERDAY",
+        start_utc=yesterday_start,
+        end_utc=today_start,
+        summary_mode=mode,
+    )
 
 
 async def last7days_command(update, context):
@@ -621,7 +756,7 @@ async def statsrange_command(update, context):
     args = context.args
 
     if len(args) < 2:
-        await message.reply_text("Usage: /statsrange YYYY-MM-DD YYYY-MM-DD")
+        await message.reply_text("Usage: /statsrange YYYY-MM-DD YYYY-MM-DD [full|medium|compact]")
         return
 
     start_str, end_str = args[0], args[1]
@@ -650,6 +785,52 @@ async def statsrange_command(update, context):
         end_exclusive,
         summary_mode=mode,
     )
+
+
+async def revenue_command(update, context):
+    """
+    /revenue – daily totals for current calendar week (Monday → now).
+    """
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    start = start_of_week_utc()
+    end = datetime.now(tz=UTC)
+
+    orders = supabase_fetch_orders(
+        chat_id=chat_id,
+        status="accepted",
+        start_utc=start,
+        end_utc=end,
+        order_desc=False,
+    )
+    text = summarize_revenue_by_day(orders, "REVENUE – THIS WEEK")
+    await message.reply_text(text)
+
+
+async def stats_command(update, context):
+    """
+    /stats – summary stats for current calendar week (Monday → now).
+    """
+    message = update.message
+    if not message:
+        return
+
+    chat_id = message.chat_id
+    start = start_of_week_utc()
+    end = datetime.now(tz=UTC)
+
+    orders = supabase_fetch_orders(
+        chat_id=chat_id,
+        status="accepted",
+        start_utc=start,
+        end_utc=end,
+        order_desc=False,
+    )
+    text = summarize_stats_week(orders, "STATS – THIS WEEK")
+    await message.reply_text(text)
 
 
 async def pending_command(update, context):
@@ -692,8 +873,16 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("mode", mode_command))
 
+    # Reporting commands
     app.add_handler(CommandHandler("today", today_command))
+    app.add_handler(CommandHandler("yesterday", yesterday_command))
     app.add_handler(CommandHandler("totals", totals_command))
+    app.add_handler(CommandHandler("week", week_command))
+    app.add_handler(CommandHandler("orders", orders_command))
+    app.add_handler(CommandHandler("revenue", revenue_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+
+    # Advanced range stats
     app.add_handler(CommandHandler("last7days", last7days_command))
     app.add_handler(CommandHandler("last14days", last14days_command))
     app.add_handler(CommandHandler("last30days", last30days_command))
@@ -703,8 +892,11 @@ def main():
     app.add_handler(CommandHandler("last365days", last365days_command))
     app.add_handler(CommandHandler("alltime", alltime_command))
     app.add_handler(CommandHandler("statsrange", statsrange_command))
+
+    # Pending viewer
     app.add_handler(CommandHandler("pending", pending_command))
 
+    # NLP order / confirmation handler
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
